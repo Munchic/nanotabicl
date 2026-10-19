@@ -28,7 +28,7 @@ class NanoTabICLv2(nn.Module):
         self.out_ln = nn.LayerNorm(icl_dim)
         self.out_mlp = get_mlp(icl_dim, icl_dim * 2, out_dim)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y: torch.Tensor, extra_emb: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
         n_batch, n_rows, n_cols = x.shape
         n_batch, n_train = y.shape
 
@@ -37,6 +37,8 @@ class NanoTabICLv2(nn.Module):
         idxs = torch.arange(n_cols, dtype=torch.long, device=x.device)
         x = torch.stack([x[:, :, (idxs + (2 ** i - 1)) % n_cols] for i in range(self.feature_group_size)], dim=-1)
         emb = self.x_embed(x)  # emb.shape = (n_batch, n_rows, n_cols, embed_dim)
+        if extra_emb is not None:  # optional extra per-cell embedding, e.g. from a replicate encoder (obs_model.py)
+            emb = emb + extra_emb
         emb[:, :n_train] += self.y_embed_in(y[:, :, None, None])
 
         # ----- TF_col: induced self-attention within each column
