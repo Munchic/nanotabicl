@@ -29,9 +29,41 @@ MODEL_CFG = dict(max_classes=10, out_dim=10, embed_dim=32, col_num_blocks=2, row
 
 # ----- observation model (batched, on GPU) -----
 
-def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None, k_max=None, regimes=None, n_train=None):
+LAYOUTS = ['table', 'col', 'group', 'colgroup']
+P_PRECISE = 0.2  # col / colgroup layouts: share of exact (n = 1, noise-free) columns, e.g. covariates or metadata
+
+
+def noise_layout(layout, B, R, C, n_groups, g, dev):
+    """Heterogeneous observation models within a table (Exp 7). -> noise ids and scales broadcastable to (B, R, C, 1),
+    precise-column mask (B, 1, C, 1) or None, per-row group (B, R) or None, per-row replicate cap (B, R, 1, 1) or None.
+    col: own noise model + scale per column; group: rows split into n_groups groups with their own model + scale;
+    colgroup: own model + scale per (group, column). Group layouts: each group's replicate count is capped at
+    U{1..K} w.p. 0.5 (e.g. one lab runs singles, another triplicates)."""
+    n_id = len(TRAIN_NOISES)
+    logu = lambda *shape: torch.exp(torch.empty(*shape, device=dev).uniform_(math.log(0.1), 0.0, generator=g))
+    precise = gid = cap = None
+    if layout == 'col':
+        ids, sc = torch.randint(n_id, (B, 1, C, 1), device=dev, generator=g), logu(B, 1, C, 1)
+    else:
+        gid = torch.randint(n_groups, (B, R), device=dev, generator=g)
+        shape = (B, n_groups, 1) if layout == 'group' else (B, n_groups, C)
+        ids_g, sc_g = torch.randint(n_id, shape, device=dev, generator=g), logu(*shape)
+        idx = gid[..., None].expand(B, R, shape[-1])
+        ids, sc = ids_g.gather(1, idx)[..., None], sc_g.gather(1, idx)[..., None]
+        k_cap = torch.where(torch.rand(B, n_groups, device=dev, generator=g) < 0.5,
+                            torch.randint(1, K + 1, (B, n_groups), device=dev, generator=g), 10 ** 6)
+        cap = k_cap.gather(1, gid)[..., None, None]
+    if layout in ('col', 'colgroup'):
+        precise = torch.rand(B, 1, C, 1, device=dev, generator=g) < P_PRECISE
+    return ids, sc, precise, gid, cap
+
+
+def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None, k_max=None, regimes=None, n_train=None,
+            layout=None, n_groups=3, group_visible=False):
     """X: (B, R, C) clean. Returns reps (B, R, C, K), mask (B, R, C, K). Per table: clean w.p. p_clean, else a
-    random noise model with scale ~ logU(0.1, 1) * sd(col) (or the given noise/scale); counts ~ U{1..K} per cell."""
+    random noise model with scale ~ logU(0.1, 1) * sd(col) (or the given noise/scale); counts ~ U{1..K} per cell.
+    layout (Exp 7, see noise_layout): None / 'table' = one model + scale per table (the original stream);
+    group layouts with group_visible append the exact group index as an extra column (C + 1)."""
     B, R, C = X.shape
     dev = X.device
     K = k_max or globals()['K']  # tensor width = max replicates per cell in this batch
@@ -40,12 +72,25 @@ def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None
         scale = torch.exp(torch.empty(B, 1, 1, 1, device=dev).uniform_(math.log(0.1), 0.0, generator=g))
     noise_ids = (torch.full((B,), NOISES_V2.index(noise), device=dev) if noise is not None
                  else torch.randint(len(TRAIN_NOISES), (B,), device=dev, generator=g))
+    nid = noise_ids[:, None, None, None]
+    precise = cap = None
+    if layout not in (None, 'table'):
+        nid, scale, precise, gid, cap = noise_layout(layout, B, R, C, n_groups, g, dev)
+        if gid is not None and group_visible:
+            X = torch.cat([X, gid[..., None].to(X.dtype)], dim=-1)
+            C += 1
+            col_sd = X.std(dim=1, keepdim=True).clamp(min=1e-12)[..., None]
+            if nid.shape[2] > 1:  # colgroup: per-column draws for the C - 1 data columns; the group column is exact
+                nid = torch.cat([nid, torch.zeros_like(nid[:, :, :1])], dim=2)
+                scale = torch.cat([scale, torch.ones_like(scale[:, :, :1])], dim=2)
+            vis = torch.zeros(B, 1, C, 1, dtype=torch.bool, device=dev)
+            vis[:, :, -1] = True
+            precise = vis if precise is None else torch.cat([precise, precise.new_zeros(B, 1, 1, 1)], dim=2) | vis
     gauss = torch.randn(B, R, C, K, device=dev, generator=g)
     sq = torch.randn(B, R, C, K, 3, device=dev, generator=g) ** 2
     t3 = gauss / torch.sqrt(sq.sum(-1) / 3)
     t2 = gauss / torch.sqrt(sq[..., :2].sum(-1) / 2)
     cauchy = torch.tan(math.pi * (torch.rand(B, R, C, K, device=dev, generator=g) - 0.5))
-    nid = noise_ids[:, None, None, None]
     eps = torch.where(nid == 1, t3, torch.where((nid == 3) | (nid == 4) | (nid == 6), cauchy,
                                                 torch.where(nid == 8, t2, gauss)))
     row_scale = torch.where(nid == 4, torch.exp(torch.randn(B, R, 1, 1, device=dev, generator=g)), 1.0)
@@ -64,18 +109,24 @@ def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None
     hi = Xs.gather(1, (q_hi * (R - 1)).round().long().expand(B, 1, C))[..., None]
     reps = torch.where(nid == 2, torch.minimum(torch.maximum(reps, lo), hi), reps)
     # left-censoring at a lower detection limit (censored_left: q ~ U(0.1, 0.5), censored_left_heavy: q ~ U(0.4, 0.8))
-    if lod_q is None:
-        q_lod = torch.where(noise_ids == 8, 0.4, 0.1)[:, None, None] + 0.4 * torch.rand(B, 1, 1, device=dev, generator=g)
+    if lod_q is None:  # one uniform per table; per cell, the limit follows the cell's model (light / heavy)
+        u_lod = 0.4 * torch.rand(B, 1, 1, device=dev, generator=g)
+        q_lod_lt, q_lod_hv = 0.1 + u_lod, 0.4 + u_lod
     else:
-        q_lod = torch.full((B, 1, 1), lod_q, device=dev)
-    lod = Xs.gather(1, (q_lod * (R - 1)).round().long().expand(B, 1, C))[..., None]
+        q_lod_lt = q_lod_hv = torch.full((B, 1, 1), lod_q, device=dev)
+    lod_at = lambda q_: Xs.gather(1, (q_ * (R - 1)).round().long().expand(B, 1, C))[..., None]
+    lod = torch.where(nid == 8, lod_at(q_lod_hv), lod_at(q_lod_lt))
     reps = torch.where((nid == 7) | (nid == 8), torch.maximum(reps, lod), reps)
-    if (noise_ids >= len(NOISES)).any():  # Exp 6 modes (only drawn with --noise_set v2 or when evaluating them)
-        reps = observe_v2(X, reps, noise_ids, col_sd, scale, eps, g)
+    if (nid >= len(NOISES)).any():  # Exp 6 modes (only drawn with --noise_set v2 or when evaluating them)
+        reps = observe_v2(X, reps, nid, col_sd, scale, eps, g)
     counts = torch.randint(1, K + 1, (B, R, C, 1), device=dev, generator=g)
     if regimes is not None:  # per-table count regime (Exp 5); None keeps the original per-cell draw (and RNG stream)
         counts = count_regimes(counts, regimes, n_train, K, g)
     clean = (torch.rand(B, device=dev, generator=g) < p_clean)[:, None, None, None]
+    if cap is not None:  # per-group replicate cap
+        counts = torch.minimum(counts, cap)
+    if precise is not None:
+        clean = clean | precise
     counts = torch.where(clean, 1, counts)
     reps = torch.where(clean, X[..., None].expand_as(reps), reps)
     mask = torch.arange(K, device=dev) < counts
@@ -90,14 +141,13 @@ def masked_quantile(reps, mask, q):  # deterministic (sort-based) == numpy's def
     return (v_lo + (pos - lo) * (v_hi - v_lo)).squeeze(-1)
 
 
-def observe_v2(X, reps, noise_ids, col_sd, scale, eps, g):
+def observe_v2(X, reps, nid, col_sd, scale, eps, g):
     """GPU versions of gen_data.py's Exp 6 modes (same constants), overriding reps for tables with those noise ids.
     eps is the table's Gaussian draw (B, R, C, K); scale = base noise scale (B or 1, 1, 1, 1) in col-sd units."""
     from gen_data import (FAIL_P_MAX, FAIL_GOOD_MULT, FAIL_SHIFT, CV_LN, LOD_THETA_Q, LOD_SLOPE, LOD_FLOOR_Q, ULOQ_Q,
                           PLATE_SD, PLATE_COL_SD)
     B, R, C, K = eps.shape
     dev = X.device
-    nid = noise_ids[:, None, None, None]
     sd = col_sd  # (B, 1, C, 1)
     good = X[..., None] + scale * FAIL_GOOD_MULT * sd * eps
     q = lambda p: torch.quantile(X, p, dim=1, keepdim=True)[..., None]  # (B, 1, C, 1)
@@ -184,7 +234,8 @@ def task_loss(out, y_test, y_ctx):  # -> per-test-row loss (B, T), valid mask (B
     return ce_loss(out, y_test), valid
 
 
-def model_forward(model, mode, X, y_train, g, **obs_kw):
+def model_forward(model, mode, X, y_train, g, aux=False, **obs_kw):
+    """-> logits, or (logits, auxiliary denoising loss) when aux (obs mode, model built with aux=True)."""
     if mode == 'clean':
         return model(X, y_train)
     reps, mask = observe(X, g, **obs_kw)
@@ -194,7 +245,12 @@ def model_forward(model, mode, X, y_train, g, **obs_kw):
         return model(masked_quantile(reps, mask, 0.5), y_train)
     if mode == 'stats':
         return model(summary_stats(reps, mask), y_train)
-    return model(reps, mask, y_train)
+    out = model(reps, mask, y_train)
+    if not aux:
+        return out
+    if reps.shape[2] > X.shape[2]:  # visible group column (exact) appended by observe
+        X = torch.cat([X, reps[:, :, X.shape[2]:, 0]], dim=-1)
+    return out, model.aux_loss(X)
 
 
 # ----- data -----
@@ -203,8 +259,11 @@ class Bank:
     def __init__(self, path, n_blocks=None):
         self.path = path
         self._files = sorted(glob.glob(os.path.join(self.path, 'block_*.npz')))
-        if n_blocks is not None:  # reproducibility: train on a fixed, complete bank only
-            assert len(self._files) == n_blocks, f'bank has {len(self._files)} blocks, expected {n_blocks}'
+        if n_blocks is not None:  # reproducibility: train on a fixed, complete bank prefix only (blocks are seeded by
+            # index, so extending the bank leaves blocks 0..n_blocks-1 and every earlier run unchanged)
+            assert len(self._files) >= n_blocks, f'bank has {len(self._files)} blocks, expected {n_blocks}'
+            assert os.path.basename(self._files[n_blocks - 1]) == f'block_{n_blocks - 1:05d}.npz', 'bank prefix incomplete'
+            self._files = self._files[:n_blocks]
 
     def files(self):
         return self._files
@@ -303,12 +362,19 @@ def main():
     ap.add_argument('--k50_prob', type=float, default=0.0, help='share of batches with up to 50 replicates per cell')
     ap.add_argument('--noise_set', choices=['v1', 'v2'], default='v1', help='v2 adds the Exp 6 failure / literature modes')
     ap.add_argument('--y_clip', type=float, default=0.0, help='regression: soft-clip standardized targets to +-y_clip in training')
+    ap.add_argument('--layouts', default='', help='json weights over LAYOUTS (table,col,group,colgroup), drawn per batch; '
+                                                  'empty = one model per table (original stream)')
+    ap.add_argument('--group_vis_prob', type=float, default=0.5, help='group layouts: share of batches with the group column')
+    ap.add_argument('--aux_w', type=float, default=0.0, help='obs: weight of the auxiliary denoising loss (needs rep_cfg aux)')
     args = ap.parse_args()
     dev = 'cuda'
     global TASK, TRAIN_NOISES
     TASK = args.task
     TRAIN_NOISES = NOISES_V2 if args.noise_set == 'v2' else NOISES
     regimes = json.loads(args.regimes) if args.regimes else None
+    layouts = (lambda w: np.asarray(w) / np.sum(w))(json.loads(args.layouts)) if args.layouts else None
+    use_aux = args.aux_w > 0
+    assert not use_aux or (args.mode == 'obs' and json.loads(args.rep_cfg).get('aux')), '--aux_w needs obs + rep_cfg aux'
     if not args.nondeterministic:  # bitwise-reproducible training (also across exact resumes)
         os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
         torch.use_deterministic_algorithms(True)
@@ -374,6 +440,9 @@ def main():
             obs_kw['k_max'] = 50 if rng.random() < args.k50_prob else K
         if regimes is not None:
             obs_kw.update(regimes=regimes, n_train=n_train)
+        if layouts is not None:  # heterogeneous observation models (Exp 7): one layout per batch
+            lay = LAYOUTS[rng.choice(len(LAYOUTS), p=layouts)]
+            obs_kw.update(layout=lay, n_groups=int(rng.integers(2, 5)), group_visible=bool(rng.random() < args.group_vis_prob))
         opt.zero_grad(set_to_none=True)
         mb = args.micro_batch or args.batch_size
         if obs_kw.get('k_max', K) > K:  # up-to-50-replicate batches: 4x smaller micro-batches (same effective batch)
@@ -381,8 +450,12 @@ def main():
         loss_sum, ok = 0.0, True
         for i in range(0, args.batch_size, mb):  # gradient accumulation; loss = mean over all valid test cells
             with torch.autocast('cuda', dtype=torch.bfloat16):
-                logits = model_forward(model, args.mode, X[i:i + mb], y[i:i + mb, :n_train], g, **obs_kw)
+                logits = model_forward(model, args.mode, X[i:i + mb], y[i:i + mb, :n_train], g, aux=use_aux, **obs_kw)
+            if use_aux:
+                logits, l_aux = logits
             l = task_loss(logits, y_test[i:i + mb], y[i:i + mb, :n_train])[0][valid[i:i + mb]].sum() / valid.sum()
+            if use_aux:  # per-micro-batch mean, weighted by the micro-batch's share of the batch
+                l = l + args.aux_w * l_aux * (X[i:i + mb].shape[0] / args.batch_size)
             if not torch.isfinite(l):
                 ok = False
                 break

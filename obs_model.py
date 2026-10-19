@@ -4,7 +4,8 @@ from model import NanoTabICLv2, get_mlp
 
 class ReplicateEncoder(nn.Module):  # set encoder over the replicates of one cell -> (d_s + 1)-dim vector
     def __init__(self, d_s: int = 32, n_heads: int = 4, use_sab: bool = True, use_null: bool = True,
-                 med_feat: bool = False, loc_head: bool = False, robust_feats: bool = False, pool: str = 'attn'):
+                 med_feat: bool = False, loc_head: bool = False, robust_feats: bool = False, pool: str = 'attn',
+                 col_ctx: bool = False):
         super().__init__()
         # pool: 'attn' = learned seed query + null key/value (default); 'v2s' = Vec2Summ-style moment summary of the
         # replicate embeddings (Li et al. 2025): LN(W [mean_k h_k, log(var_k h_k + eps)])
@@ -15,6 +16,9 @@ class ReplicateEncoder(nn.Module):  # set encoder over the replicates of one cel
         self.robust_feats = robust_feats
         # per-replicate embedding of (z, z - z_bar[, z - z_med][, robust residual, within-cell rank, limit-tie flag])
         self.phi = get_mlp(2 + med_feat + 3 * robust_feats, 2 * d_s, d_s)
+        # col_ctx: separate per-replicate DeepSets embedding, averaged over a cell's replicates; the caller pools it
+        # over the column's replicated context cells into a column token (see ObsNanoTabICL.cell_inputs)
+        self.phi_col = get_mlp(2 + med_feat + 3 * robust_feats, 2 * d_s, d_s) if col_ctx else None
         self.loc_head = nn.Linear(d_s, 1) if loc_head else None  # per-replicate location score (zero-init: mean)
         if loc_head:
             nn.init.zeros_(self.loc_head.weight)
@@ -30,7 +34,7 @@ class ReplicateEncoder(nn.Module):  # set encoder over the replicates of one cel
     def heads(self, t):  # (M, L, d) -> (M, H, L, d/H)
         return t.unflatten(-1, (self.n_heads, -1)).transpose(1, 2)
 
-    def forward(self, z: torch.Tensor, mask: torch.Tensor, tie: torch.Tensor | None = None):
+    def forward(self, z: torch.Tensor, mask: torch.Tensor, tie: torch.Tensor | None = None, ctx_fn=None):
         # z: (M, K) standardized replicates (padding arbitrary), mask: (M, K) bool, every row has >= 2 valid entries
         # tie: (M, K) bool, replicate equals the column's extreme context value (robust_feats only)
         # returns (cell vector (M, d_s + 1), location scores (M, K) or None)
@@ -47,7 +51,11 @@ class ReplicateEncoder(nn.Module):  # set encoder over the replicates of one cel
             ranks = torch.where(mask, z, float('inf')).argsort(dim=-1, stable=True).argsort(dim=-1, stable=True)
             feats += [10 * torch.tanh(resid / 10), ranks.to(z.dtype) / (n - 1).clamp(min=1).to(z.dtype),
                       tie.to(z.dtype)]
-        h = self.phi(torch.stack(feats, dim=-1))  # (M, K, d_s)
+        f = torch.stack(feats, dim=-1)
+        h = self.phi(f)  # (M, K, d_s)
+        if ctx_fn is not None:  # column context: (M, d_s) per-cell summary -> (M, d_s) additive term for every replicate
+            u = (self.phi_col(f) * mask[..., None].to(h.dtype)).sum(1) / n.to(h.dtype)
+            h = h + ctx_fn(u)[:, None].to(h.dtype)
         key_mask = mask[:, None, None, :]  # (M, 1, 1, K): attend only to real replicates
         if self.use_sab:
             q, k, v = self.heads(self.sab_qkv(self.sab_ln(h))).chunk(3, dim=-1)
@@ -94,8 +102,19 @@ class ObsNanoTabICL(NanoTabICLv2):
     def __init__(self, *args, d_s: int = 32, rep_heads: int = 4, use_sab: bool = True, use_null: bool = True,
                  center: str = 'mean', med_feat: bool = False, std: str = 'meansd', zclip: float = 0.0,
                  robust_feats: bool = False, single_emb: str = 'none', temp_head: bool = False, dist_emb: bool = False,
-                 pool: str = 'attn', row_emb: bool = False, **kwargs):
+                 pool: str = 'attn', row_emb: bool = False, aux: bool = False, aux_center: bool = True,
+                 col_ctx: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
+        # aux: training-only denoising targets for replicated cells (the clean value is known in pretraining).
+        # rep_aux: linear head on the cell vector -> quantiles AUX_TAUS of the clean z; the learned center is also
+        # pulled toward the clean value. Not used in forward -> both guarantees are unaffected.
+        self.aux, self.aux_center = aux, aux_center  # aux_center=False: quantile head only, no pull on the center
+        self._aux_state = None
+        # col_ctx (backlog A1): column token = mean over the column's replicated CONTEXT cells of the encoder's
+        # phi_col summaries -> LayerNorm -> zero-init linear, added to every replicate embedding of the column's
+        # replicated cells (a learned, column-level empirical Bayes: failure floors / shifts, limits, noise shape).
+        # n = 1 cells are untouched and step 0 is unchanged.
+        self.col_ctx = col_ctx
         # temp_head: per-query-row temperature T = exp(W2 tanh(W1 f_row)) (bias-free, W2 zero-init) from row reliability
         # features that are exactly 0 for all-single tables -> stock behaviour there is preserved exactly.
         # classification: logits / T; regression: quantiles spread around the median x T.
@@ -111,7 +130,12 @@ class ObsNanoTabICL(NanoTabICLv2):
         # (robust), 'attn' (learned attention-weighted location over replicates; zero-init scores -> starts at the mean)
         self.center = center
         self.rep_enc = ReplicateEncoder(d_s=d_s, n_heads=rep_heads, use_sab=use_sab, use_null=use_null,
-                                        med_feat=med_feat, loc_head=center == 'attn', robust_feats=robust_feats, pool=pool)
+                                        med_feat=med_feat, loc_head=center == 'attn', robust_feats=robust_feats, pool=pool,
+                                        col_ctx=col_ctx)
+        if col_ctx:
+            self.rep_col = nn.Sequential(nn.LayerNorm(d_s), nn.Linear(d_s, d_s))
+            nn.init.zeros_(self.rep_col[-1].weight)
+            nn.init.zeros_(self.rep_col[-1].bias)
         self.rep_proj = nn.Linear(self.feature_group_size * (d_s + 1), self.x_embed.out_features, bias=False)
         nn.init.zeros_(self.rep_proj.weight)
         # dist_emb: fixed probabilistic cell descriptors (no learned encoder needed to express uncertainty), for every
@@ -137,6 +161,8 @@ class ObsNanoTabICL(NanoTabICLv2):
             self.rep_row = nn.Sequential(nn.Linear(7, 32, bias=False), nn.Tanh(),
                                          nn.Linear(32, self.out_ln.normalized_shape[0], bias=False))
             nn.init.zeros_(self.rep_row[-1].weight)
+        if aux:
+            self.rep_aux = nn.Linear(d_s + 1, len(self.AUX_TAUS))
         if single_emb != 'none':
             self.rep_single = get_mlp(1, 16, d_s + 1)  # input: log robust spread (scaled) or a constant 0 (const)
             nn.init.zeros_(self.rep_single[-1].weight)
@@ -159,6 +185,26 @@ class ObsNanoTabICL(NanoTabICLv2):
         return out
 
     N_RFF, NU0 = 8, 3.0
+    AUX_TAUS = (0.1, 0.25, 0.5, 0.75, 0.9)
+
+    def aux_loss(self, x_clean: torch.Tensor) -> torch.Tensor:
+        """x_clean: (B, R, C) clean values of the last forward's cells (training only). Mean over replicated cells of
+        the pinball loss of rep_aux's quantiles + the absolute error of the learned center, both in the encoder's
+        standardized (and soft-clipped) units."""
+        multi, vec, x_c, mu, sd = self._aux_state
+        self._aux_state = None
+        if vec is None:
+            return x_clean.new_zeros(())
+        clip = (lambda t: self.zclip * torch.tanh(t / self.zclip)) if self.zclip > 0 else (lambda t: t)
+        zt = clip((x_clean.float() - mu.float()) / sd.float())[multi]  # (M,)
+        q = self.rep_aux(vec.to(self.rep_aux.weight.dtype)).float()
+        taus = torch.tensor(self.AUX_TAUS, device=q.device)
+        diff = zt[:, None] - q
+        loss = torch.maximum(taus * diff, (taus - 1) * diff).mean()
+        if self.center == 'attn' and self.aux_center:
+            zc = clip((x_c.float() - mu.float()) / sd.float())[multi]
+            loss = loss + (zc - zt).abs().mean()
+        return loss
 
     def distributional(self, z, mask, n, n_train, dtype):
         """Fixed probabilistic descriptors (see __init__); returns the additive cell vector (zero outside replicated
@@ -238,13 +284,26 @@ class ObsNanoTabICL(NanoTabICLv2):
         multi = n > 1  # gate: only cells with >= 2 replicates go through the set encoder
         cell = z.new_zeros(n_batch, n_rows, n_cols, self.rep_proj.in_features // self.feature_group_size)
         x_c = x if self.center == 'mean' else x_s
+        vec = None
+        ctx_fn = None
+        if self.col_ctx:
+            use = multi & (torch.arange(n_rows, device=reps.device) < n_train)[None, :, None]  # replicated context cells
+
+            def ctx_fn(u):
+                full = u.new_zeros(n_batch, n_rows, n_cols, u.shape[-1])
+                full[multi] = u
+                w = use[..., None].to(u.dtype)
+                tok = (full * w).sum(1, keepdim=True) / w.sum(1, keepdim=True).clamp(min=1)  # (B, 1, C, d_s)
+                return self.rep_col(tok).expand(n_batch, n_rows, n_cols, -1)[multi]
         if multi.any():
-            vec, scores = self.rep_enc(z[multi], mask[multi], None if tie is None else tie[multi])
+            vec, scores = self.rep_enc(z[multi], mask[multi], None if tie is None else tie[multi], ctx_fn=ctx_fn)
             cell[multi] = vec.to(cell.dtype)
             if self.center == 'attn':  # learned location: softmax-weighted replicates (raw scale), n = 1 cells keep x
                 w = torch.softmax(scores.float().masked_fill(~mask[multi], float('-inf')), dim=-1)
                 x_c = x.clone()
                 x_c[multi] = (w * reps[multi]).sum(-1).to(x.dtype)
+        if self.aux and self.training:  # kept for aux_loss(); mu / sd: (B, 1, C) column standardization
+            self._aux_state = (multi, vec, x_c, mu[..., 0], sd[..., 0])
         if self.dist_emb or self.temp_head:
             cell = cell + self.distributional(z, mask, n, n_train, cell.dtype)
         if self.single_emb != 'none':
@@ -273,6 +332,10 @@ if __name__ == '__main__':  # step 0 == stock model, and n = 1 everywhere == sto
                col_nhead=4, row_nhead=4, icl_nhead=4, n_cls_rows=32)
     stock, obs = NanoTabICLv2(**cfg), ObsNanoTabICL(**cfg)
     obs.load_state_dict(stock.state_dict(), strict=False)
+    if '--col_ctx' in __import__('sys').argv:
+        obs = ObsNanoTabICL(**cfg, center='attn', med_feat=True, std='medmad', zclip=10.0, robust_feats=True,
+                            dist_emb=True, temp_head=True, col_ctx=True)
+        obs.load_state_dict(stock.state_dict(), strict=False)
     B, R, C, K, n_train = 2, 40, 5, 10, 24
     reps = torch.randn(B, R, C, K)
     mask = torch.arange(K) < torch.randint(1, K + 1, (B, R, C, 1))
@@ -280,6 +343,9 @@ if __name__ == '__main__':  # step 0 == stock model, and n = 1 everywhere == sto
     xm = torch.where(mask, reps, 0).sum(-1) / mask.sum(-1)
     print('step0 max|diff| =', (obs(reps, mask, y) - stock(xm, y)).abs().max().item())
     nn.init.normal_(obs.rep_proj.weight)
+    for m_ in [getattr(obs, 'rep_col', None), getattr(obs, 'rep_dist', None), getattr(obs, 'rep_temp', None)]:
+        if m_ is not None:  # randomize every zero-init map: n = 1 tables must still equal stock
+            [nn.init.normal_(p_) for p_ in m_.parameters()]
     m1 = torch.zeros_like(mask); m1[..., 0] = True
     print('n=1, trained U: max|diff| =', (obs(reps, m1, y) - stock(reps[..., 0], y)).abs().max().item())
     print('n>1, trained U: max|diff| =', (obs(reps, mask, y) - stock(xm, y)).abs().max().item(), '(should be > 0)')

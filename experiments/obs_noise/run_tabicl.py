@@ -25,8 +25,9 @@ def base_ckpt_path() -> str:
     return hf_hub_download('jingang/TabICL', BASE_CKPT)
 
 
-def predict(ckpt: str, Xtr, ytr, Xte) -> np.ndarray:
-    return TabICLClassifier(model_path=ckpt, random_state=SEED, device='cuda').fit(Xtr, ytr).predict_proba(Xte)
+def predict(ckpt: str, Xtr, ytr, Xte, n_estimators: int = 8) -> np.ndarray:
+    return TabICLClassifier(model_path=ckpt, random_state=SEED, device='cuda',
+                            n_estimators=n_estimators).fit(Xtr, ytr).predict_proba(Xte)
 
 
 def metrics(y, p) -> dict:

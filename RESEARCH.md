@@ -1085,3 +1085,237 @@ The temperature head's 7 row features (mean log n, single-cell share in replicat
 6. Exp 7 with the winning branch configuration and P5 mixed into the prior.
 
 Items that change the prior (P1–P5) need matched median / stats baselines retrained on the same prior.
+
+---
+
+## Exp 7 — Ensembling, auxiliary denoising loss, heterogeneous noise within a table (2026-10-19, in progress)
+
+Goal: beat matched median imputation by a clear margin, and match TabICLv2 (27M) with the 1M model, before porting the branch to TabICLv2 (see the plan above).
+
+**Noise modes covered so far (check).**
+- **Bimodal / median-breaking:** yes. `fail_shift` (failed replicates at x + 3 sd) and `fail_floor` (failed replicates at a column floor), with per-cell failure rate U(0, 0.8).
+- **Intensity-dependent non-detects:** yes (`lod_logistic`), but substituted by a floor value, not missing.
+- **Missing cells (n = 0, MCAR / MAR / MNAR):** **not yet.** Every cell has ≥ 1 replicate. That is backlog item P3 and needs missing-value handling in the backbone.
+
+### 7a. Test-time ensembling (no training)
+
+[obs_eval.py](experiments/obs_noise/obs_eval.py) `--n_ens N`: member i uses a random column permutation (i = 0: identity) and class labels shifted cyclically by i. Probabilities (classification) or sorted quantiles (regression) are averaged. `--n_ens 1` reproduces the earlier results exactly (max |Δ log-loss| = 0.0 over 297 records). TabICLv2 was re-run with `n_estimators=1` (`N_EST=1 tabicl_eval.py`, tag `tabicl_median_e1`).
+
+| | clean acc, 1 → 8 | main noisy acc, 1 → 8 | clean CRPS, 1 → 8 | main noisy CRPS, 1 → 8 |
+|---|---|---|---|---|
+| stock nanoTabICL | 0.703 → 0.714 | 0.601 → 0.611 | 0.160 → 0.156 | 0.332 → 0.329 |
+| median imputation (p5 / r5) | 0.701 → 0.711 | 0.626 → 0.633 | 0.160 → 0.158 | 0.298 → 0.296 |
+| ours (p5 / r5) | 0.703 → 0.713 | 0.637 → 0.644 | 0.160 → 0.158 | 0.279 → 0.276 |
+| TabICLv2 27M, median input | 0.742 → 0.742 | 0.645 → 0.646 | 0.125 → 0.125 | 0.278 → 0.278 |
+
+- **Ensembling is worth about +1 point of accuracy (and −0.002 to −0.004 CRPS) for the 1M models.**
+- **It is worth nothing for TabICLv2.** Its 1-estimator and 8-estimator results are the same, so its lead is not ensembling.
+- **With 8 members, our model matches TabICLv2 on the noisy core settings:**
+  - classification 0.644 vs 0.646 (paired, TabICLv2 is +0.003);
+  - regression CRPS 0.276 vs 0.278, i.e. better.
+- **The remaining gap is clean-data quality of the 1M backbone:** 0.713 vs 0.742 accuracy; CRPS 0.158 vs 0.125. That is a backbone or pretraining question (backlog T2), not a replicate-handling one.
+- **Calibration.** Ensembling makes the nano models slightly underconfident: overconfidence −0.018, ECE 0.035 → 0.041, cov90 0.90 → 0.92. TabICLv2 is overconfident (+0.017).
+
+### 7b. Heterogeneous noise within a table: new evaluation settings
+
+The training prior so far drew **one** noise model and scale per table ([obs_train.py](experiments/obs_noise/obs_train.py) `observe`). Real panels mix precise and noisy assays, and data from several labs / batches / sites.
+
+New settings ([gen_ext3.py](experiments/obs_noise/gen_ext3.py), `artifacts/data_ext3`, source `ext3`):
+
+| setting | design |
+|---|---|
+| `percol` | own core mode + scale (0.5 sd × logU(0.5, 2)) per column; 20% exact columns (n = 1) |
+| `pergroup` | 3 hidden row groups, each with its own mode, scale and (w.p. 0.5) a replicate cap U{1..10} |
+| `pergroup_vis` | the same draws + the exact group index as a column |
+| `colgroup_vis` | own mode + scale per (group, column); group column visible; 20% exact columns |
+
+The Bayes oracle (`bayes.py ext3`) knows each cell's model, scale and group. It reduces the median-imputation error (median |error| / sd) from 0.15 / 0.26 / 0.26 / 0.13 to 0.09 / 0.18 / 0.18 / 0.08.
+
+Existing models (trained on the per-table prior), mean accuracy / CRPS over the 4 settings:
+
+| | het acc, 1 pass | het acc, ens 8 | het CRPS, 1 pass | het CRPS, ens 8 |
+|---|---|---|---|---|
+| stock | 0.606 | 0.618 | 0.306 | 0.303 |
+| median imputation (p5 / r5) | 0.626 | 0.635 | 0.285 | 0.283 |
+| ours (p5 / r5) | 0.627 | 0.637 | 0.277 | 0.274 |
+| nano + Bayes-oracle input | 0.636 | | 0.278 | |
+
+**The per-table-trained encoder barely beats median imputation here** in classification (`percol` 0.660 vs 0.662 for one pass) and only modestly in regression (−0.006 CRPS). This is the prior gap that 7d addresses.
+
+### 7c / 7d. Auxiliary denoising loss and heterogeneous-noise training (running)
+
+- **Auxiliary loss** (`rep_cfg aux`, `--aux_w 0.3`). Training knows the clean value, so replicated cells get extra targets:
+  - a linear head on the cell vector predicts the 10/25/50/75/90% quantiles of the clean z (pinball loss);
+  - the learned attention-weighted center is pulled toward the clean z (absolute error).
+
+  Both are in the encoder's standardized, soft-clipped units. The head is unused at inference, so both guarantees are unchanged (re-verified). Weight 0.3: at 1.0 the auxiliary term (about 1.1) was about twice the task loss.
+- **Noise layouts** (`--layouts '[0.25,0.25,0.25,0.25]'` over `table, col, group, colgroup`, one layout per batch):
+  - `col`: own model + scale per column, 20% exact columns;
+  - `group`: 2–4 row groups with their own model, scale and (w.p. 0.5) replicate cap;
+  - `colgroup`: per (group, column);
+  - in half of the group batches the exact group index is appended as a column (`--group_vis_prob`).
+
+  The default (no `--layouts`) reproduces the old random stream bit-for-bit (checked against the previous `observe` for v1 / v2, with and without count regimes).
+- **Runs** ([phase4.sh](experiments/obs_noise/phase4.sh); same init, budget and mixture as p5 / r5: 8000 steps from stock, v2 modes, count regimes, 20% K ≤ 50 batches):
+  - `p7_obs_dist_temp_aux` / `r7_…`: aux only;
+  - `p7L_median`, `p7L_obs_dist_temp`, `p7L_obs_dist_temp_aux` (and `r7L_…`): het-trained, with a matched median baseline.
+- **Bank extended** to 8000 blocks per task for backlog T2 (longer stock pretraining on fresh data). Blocks are seeded by index, and `Bank` now uses the first `--n_blocks` files, so earlier runs are unchanged.
+
+Summary script: [compare_exp7.py](experiments/obs_noise/compare_exp7.py).
+
+---
+
+## Real-data evaluation (planned, 2026-10-19)
+
+**Why.** Every result so far uses simulated observation models on top of clean tables. Before the TabICLv2 port (Exp 7 plan), check that the gains appear on **real** measurement noise: real replicates, real non-detects and failures, and per-column noise that nobody chose. On real data there is no `X_clean` and no Bayes oracle, so the comparison is on task metrics only.
+
+**Datasets** (downloaded to `experiments/obs_noise/artifacts/real_raw/`, which is gitignored). All three are standard benchmarks with published baselines.
+
+| dataset | used in | rows × columns | replicates per cell | real noise | label / split |
+|---|---|---|---|---|---|
+| **Tox21 qHTS** (`tox21/`) | MoleculeNet / TDC Tox21 (the 12 tasks), Tox21 Data Challenge 2014 | ≈ 10k substances × 12 assays (AC50, efficacy, curve class) | 3 independent runs (`SAMPLE_DATA_TYPE` = `set1/2/3`); 2–5% of substances have extra samples or controls per run | inactive = no AC50 (~48%), i.e. right-censored at the top tested concentration (≈ 90–120 µM, varies by sample); curve-fit failures; inconclusive calls; a cytotoxicity counter-screen per run (`viability1/2/3`) | held-out MoleculeNet task (e.g. predict SR-p53 from the other 11 assays' replicates); `moleculenet_tox21.csv.gz` gives the benchmark labels |
+| **LINCS Cell Painting + L1000** (`lincs/`) | Way et al. 2022 (Cell Systems), MoA prediction; JUMP / Cell Painting Gallery cpg0004 | 1,558 compounds × 6 doses × 745 morphology features (CP); 1,403 compounds × 978 genes (L1000) | CP: 5 wells (2–4 after QC); L1000: 3 (1–2 after QC) | well/plate position and batch effects, failed wells, L1000 replicates that are known to reproduce poorly | MoA class, with the paper's compound split (`split_moas_cpds.csv`); MODZ level-5 consensus (`modz_*.csv`) is the community's replicate-weighted baseline |
+| **Gas sensor array drift** (`gas_drift/`, UCI 224 / OpenML `gas-drift`) | standard drift benchmark (Vergara et al. 2012) | 13,910 measurements × 128 features | 16 sensors = 4 types × 4 physical units, so each (type, feature) has 4 replicate units | unit-to-unit bias, 3-year sensor drift (heteroscedastic, non-stationary) | 6 gas classes; batches 1–10 in time order (train early batches, test later ones). This copy has no concentration column, so classification only |
+
+**Files.**
+- `tox21/<protocol>/<protocol>.txt`: one row per (sample, run, channel) with the 15-point curve, AC50, efficacy, curve class and SMILES. Parse with `sep='\t', index_col=False` (rows have a trailing tab). `<protocol>.aggregrated.txt` is NCATS's own collapsed call, for reference. Protocols map to MoleculeNet as: NR-AR `ar-mda-kb2-luc-agonist-p1`, NR-AR-LBD `ar-bla-agonist-p1`, NR-AhR `ahr-p1`, NR-Aromatase `aromatase-p1`, NR-ER `er-luc-bg1-4e2-agonist-p2`, NR-ER-LBD `er-bla-agonist-p2`, NR-PPAR-gamma `pparg-bla-agonist-p1`, SR-ARE `are-bla-p1`, SR-ATAD5 `elg1-luc-agonist-p1`, SR-HSE `hse-bla-p1`, SR-MMP `mitotox-p1`, SR-p53 `p53-bla-p1`. Source: `https://opendata.ncats.nih.gov/public/tox21/assay/data/<protocol>.zip`.
+- `lincs/cp_level4_cpd_replicates{,_nonspherized}.csv.gz`, `lincs/L1000_level4_cpd_replicates.csv.gz`: one row per replicate well, keyed by compound × `Metadata_dose_recode` (CP) or `pert_id` × `dose` (L1000). Source: Git LFS of `broadinstitute/lincs-profiling-complementarity`.
+- `gas_drift/Dataset/batch{1..10}.dat`: libsvm format, `class idx:value …`.
+
+**To do.**
+1. **Loaders** that write the existing eval format (`<setting>__replicates` n × d × K, NaN-padded, `__counts`, `train_idx` / `test_idx`):
+   - Tox21: features = per-run log AC50 and efficacy per assay, with inactive runs reported at the top tested concentration (as in `censored`); also try an explicit censoring flag (backlog P3).
+   - LINCS: reduce 745 / 978 features to ≤ 100 (PCA fitted on DMSO wells, or feature selection), one row per compound × dose, or per compound with doses as columns. Many MoA classes: keep the top-k MoAs, or several k-way subtasks, as TabICL's class limit requires.
+   - Gas drift: 32 columns (8 features × 4 sensor types), K = 4 units. **Check** the sensor-index → type mapping in Vergara et al. 2012 before grouping.
+2. **Arms**: stock + mean, stock + median, summary stats, MODZ (LINCS), p5 / p7 median baselines, our encoder, TabICLv2 + median; 1-pass and 8-member ensembles.
+3. **Replicate-subsampling curve** (as in Exp 4): give every cell 1, 2, … K of its real replicates. If our gain over median grows with K, the model is using real replicate structure.
+4. **Real noise vs. simulated**: fit our observation-mode mixture to each dataset (tail index, censoring fraction, failure rate per column) and compare to the training prior; report which modes are actually present.
+
+### 7e. Follow-ups to the auxiliary loss (queued, [phase5.sh](experiments/obs_noise/phase5.sh))
+
+**Early validation of the aux runs** (8 noise models of the training validation set, step 3000 classification / 2000 regression):
+
+| | `fail_floor` | `fail_shift` | other settings |
+|---|---|---|---|
+| p5 → p7 (+aux) accuracy | +3.4 | −1.8 | within ±0.5 (Cauchy +0.5) |
+| r5 → r7 (+aux) CRPS | −0.037 | +0.029 | within ±0.003 |
+
+The pattern was the same at step 1000.
+
+**Hypothesis.** The center term forces each cell to pick a mode.
+- Floor failures are identifiable within a cell: they are tied at the column minimum.
+- For upward-shifted failures, a cell whose replicates are mostly failures looks like a cell at a higher value. Only the rest of the column shows the shift.
+
+**Two arms** (from stock, same budget and mixture as p5 / r5; queued after the running aux runs, followed by the het-trained aux runs):
+- `obs_dist_temp_auxq`: aux with **only the quantile head** (`aux_center: false`), i.e. no pull on the learned center.
+- `obs_dist_temp_col`: **column-context encoder** (`col_ctx`, backlog A1). A separate per-replicate DeepSets MLP (`phi_col`, same features as φ) is averaged over each cell's replicates, then over the column's replicated **context** cells. This gives a column token. LayerNorm → zero-init linear (`rep_col`) adds it to every replicate embedding of the column's replicated cells, before the self-attention block.
+  - This is a learned, column-level empirical Bayes: failure floors and shifts, limits, noise shape.
+  - +5k parameters.
+  - All-single tables still equal stock exactly, with every zero-init map randomized (`python obs_model.py --col_ctx`); step 0 equals the p5 starting point (3e-7, as for `center: attn`).
+
+### 7c result. Auxiliary loss, classification (`p7_obs_dist_temp_aux`, 27 eval datasets)
+
+The validation trend held: a **wash overall**.
+
+| paired Δ vs p5 (1 pass) | `fail_floor` | `fail_shift` | Cauchy / per-row Cauchy | heavy censoring | het settings (4) | clean |
+|---|---|---|---|---|---|---|
+| accuracy (points) | **+1.5 ± 0.5** | **−1.9 ± 0.5** | +0.2 / +0.3 | −0.3 | +0.3 to +0.4 | 0.0 |
+| log-loss | −0.034 | +0.039 | −0.009 / −0.005 | 0.000 | −0.005 to −0.008 | |
+
+- **Means over the 10 main settings:** 0.636 vs 0.637 for one pass, 0.644 = 0.644 with 8 members.
+- **Calibration:** unchanged (ECE 0.036; overconfidence −0.002).
+- **Interpretation:** supervising the denoised value per cell trades floor-type failures, which are identifiable within a cell, against shift-type failures, which are not. This supports the column-context arm (7e), now running.
+
+### 7c/7d results. Regression aux; het-trained encoder (27 eval datasets)
+
+**Regression aux (`r7_obs_dist_temp_aux`): slightly worse than r5 everywhere.**
+
+| | main CRPS | het CRPS | cov90 noisy |
+|---|---|---|---|
+| r5, 8 passes | 0.276 | 0.274 | 0.906 |
+| r7 (+aux), 8 passes | 0.278 | 0.277 | 0.901 |
+
+Clean is unchanged (0.158). With the classification wash (7c), **aux with the center term is dropped.** The quantile-only variant (`auxq`) is running.
+
+**Het-trained encoder (`p7L_obs_dist_temp`, layouts table / col / group / colgroup at 25% each):**
+
+| | main (10) | het (4) |
+|---|---|---|
+| p7L encoder vs p7L median, 8 passes | **+0.7 ± 0.2 (20/27)** | **+0.7 ± 0.2 (16/27)** |
+| p7L encoder vs p5 encoder, 8 passes | −0.4 | **+0.4** |
+
+Per het setting, vs p7L median: `percol` +0.9, `pergroup` +0.5, `pergroup_vis` +0.5, `colgroup_vis` +0.7.
+
+- **It works as intended, but the margin is small.** On the heterogeneous settings it is the best nano model (0.641 with 8 passes vs 0.637 for p5), and its margin over its matched median baseline is +0.7 points instead of +0.2 for p5. It costs 0.4 points on the single-noise-per-table settings (only 25% of its training batches use that layout).
+- **TabICLv2 is still +1.5 points ahead on het.** Its clean-backbone advantage matters more when some columns are exact (0.656 vs 0.641). Nano + Bayes-oracle input reaches only 0.636 there, so the het gap to TabICLv2 is not a replicate-handling gap.
+
+### 7e result (early stop). Aux with only the quantile head (`auxq`)
+
+Stopped at step 3000 (classification) / 2000 (regression). Validation Δ vs p5 / r5 at the same step:
+- **Classification:** within ±0.005 on all 11 settings (`fail_shift` −0.005, `fail_floor` −0.002).
+- **Regression:** slightly worse everywhere (`fail_floor` +0.009, `fail_shift` +0.006, others +0.000 to +0.002 CRPS).
+
+Without the center term, the auxiliary loss does nothing useful. **Conclusion for aux:** denoising supervision of the cell vector or center does not help on top of the task loss. **Dropped.**
+
+### 7f. Running: column context + longer stock pretraining (T2), with early stopping
+
+- **`p7_obs_dist_temp_col` / `r7_obs_dist_temp_col`:** the column-context encoder (7e), from stock, same budget as p5 / r5.
+  - **Stop rule:** at step ≥ 3000, stop if the failure modes and Cauchy are not better than p5 / r5 at the same step (≥ +0.5 points / −0.005 CRPS on at least one, no regression elsewhere).
+- **`stock2` / `stock2_reg`:** the stock recipe (clean, lr 1e-3, warmup 500, cosine to 10%), but **30k steps** (2.5×) on the **8000-block bank**: 512k tables, each seen ≈ 1.9×, vs 128k tables seen 3× for `stock`.
+  - **Stop rule:** at 20k steps, stop if clean validation accuracy is not above `stock`'s final value (0.791 classification; R² 0.701 regression). The longer cosine schedule makes equal-step comparisons before that point unfair.
+  - **If it helps:** redo the best arm and the median baseline from `stock2`, then re-compare with TabICLv2.
+- **`r7L_obs_dist_temp`** (het-trained regression encoder): paused at step 0 to free GPU memory. It resumes exactly (`resume_r7L.sh`) after the first col run finishes.
+
+### Real-data check: which observation modes are in LINCS? ([real_noise_modes.py](experiments/obs_noise/real_noise_modes.py))
+
+**Method.** Leave-one-out residuals within (compound, dose) cells with ≥ 3 replicate wells: e_k = r_k − median of the other replicates, standardized per feature by 1.4826 × median |e|. 300 random features per dataset, controls excluded.
+
+| | L1000 (25k replicate rows, 7.5M residuals) | Cell Painting, non-spherized (48k rows, 14M residuals) | Gaussian |
+|---|---|---|---|
+| P(\|e\| > 3) | 5.0e-2 | 6.8e-2 | 2.7e-3 |
+| P(\|e\| > 5) | 2.3e-2 | 3.2e-2 | 5.7e-7 |
+| P(\|e\| > 8) | 1.1e-2 | 1.7e-2 | 1e-15 |
+| \|e\| density beyond 3 | monotone decreasing | monotone decreasing | |
+| sign of extremes (\|e\| > 5), median \|share positive − 0.5\| | 0.12 (null 0.05) | 0.11 (null 0.02) | |
+| features whose extremes are > 90% one sign | 1.7% | 0.0% | |
+| values tied at the column minimum | 4e-5 | 2e-5 | |
+| replicates extreme in > 10× the usual share of features (well failures) | 0.2% (hold 2% of extremes) | 0.5% (hold 6% of extremes) | |
+
+- **Heavy tails dominate.**
+  - 2–3% of replicates are more than 5 robust sd from their siblings, and 1–1.7% more than 8 sd.
+  - The tail ratio P(> 3) / P(> 8) ≈ 4–5 sits between Cauchy (≈ 2.6) and t₃ (≈ 14), roughly t₂. That is the `censored_left_heavy` noise family, and between the `cauchy` and `student_t3` modes.
+- **No `fail_shift` signature.**
+  - The \|e\| histogram is monotone, with no bump at a fixed offset.
+  - Extremes are only mildly sign-asymmetric. Almost no feature has one-sided extremes (0–1.7%, vs 100% under `fail_shift`).
+- **No floor / non-detect substitution.** Level-4 profiles are normalized and continuous. Censoring matters for Tox21 instead: ≈ 48% of runs are inactive, i.e. right-censored at the top concentration (see the dataset table).
+- **Whole-well failures exist but are rare.** 0.2–0.5% of wells, holding 2–6% of extremes. These are failures **paired across features** (backlog P2), which the per-cell-independent prior does not model.
+- Caveat: the Cell Painting grouping kept a few large control-like groups (sizes 1632 / 3264) that the DMSO filter missed. They are well-defined replicate groups and do not change the qualitative picture.
+
+**Implications.**
+1. **Do not tune for `fail_shift`.** It stays as a robustness check, not a target. The aux loss's `fail_shift` cost (7c) is therefore less important than it looked, but aux is still dropped: it gave no gain on the heavy-tail modes either.
+2. **Judge the column-context encoder (7f) on heavy tails, censoring and het settings**, not on `fail_shift`.
+3. **Prior weighting.** Real noise looks like t₂–Cauchy tails at a 2–3% outlier rate, plus rare paired well failures. The training mixture should weight heavy-tail modes more, and add paired (well-level) failures (P2).
+
+### 7f result. Longer stock pretraining (`stock2`, 30k steps on the 8000-block bank), classification
+
+| | val clean acc / loss | eval clean acc, 1 pass | eval clean acc, 8 passes |
+|---|---|---|---|
+| `stock` (12k steps, 2000 blocks) | 0.791 / 0.503 | 0.703 | 0.714 |
+| **`stock2`** (30k steps, 8000 blocks) | **0.800 / 0.484** | **0.718** | **0.725** |
+| TabICLv2 27M | | 0.742 | 0.742 |
+
+- **Paired over the 27 datasets:** `stock2` vs `stock` is +1.4 ± 0.7 (1 pass) and +1.1 ± 0.5 (8 passes). The gap to TabICLv2 shrinks from 3.9 / 2.8 to **2.4 ± 0.9 / 1.7 ± 0.8** points.
+- **Training had not converged.** Validation accuracy kept rising to the end: 0.794 / 0.796 / 0.800 at 18k / 20k / 30k. More steps, or a slightly larger backbone, should close more of the gap.
+- **Noisy settings (stock, no replicate handling):** small gains, e.g. Gaussian 0.652 → 0.654, plate 0.662 → 0.672, `percol` 0.653 → 0.666. Cauchy is unchanged (0.531 → 0.545). Replicate handling is still needed for heavy tails.
+- **Next:**
+  - `p8_median` and `p8_obs_dist_temp_col` from `stock2` (queued, `phase7.sh`);
+  - `stock2_reg` (running).
+
+**`stock2_reg` (regression, same recipe): stopped at 20k / 30k.**
+
+| | clean validation R² | clean validation CRPS |
+|---|---|---|
+| `stock2_reg` at 20k | 0.694 | 0.182 |
+| `stock_reg` final | **0.701** | 0.183 |
+
+Mixed, and below the stop rule (R²). The R² trajectory was flat from 17k (0.693), so the longer schedule buys the regression backbone little at this size. The classification gain (+1.1 to +1.4 points clean) does not carry over to regression.

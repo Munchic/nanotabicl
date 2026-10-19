@@ -190,9 +190,42 @@ def main_ext2():  # Exp 4 settings (gen_ext2.py) -> artifacts/bayes_ext2/<datase
         print(e['name'], flush=True)
 
 
+def main_ext3():  # Exp 7 heterogeneous settings (gen_ext3.py) -> artifacts/bayes_ext3/<dataset>.npz
+    from gen_ext3 import MODELS
+    data, ext3 = art('data'), art('data_ext3')
+    out = art('bayes_ext3')
+    os.makedirs(out, exist_ok=True)
+    m3 = json.load(open(os.path.join(ext3, 'manifest.json')))
+    for e in json.load(open(os.path.join(data, 'manifest.json')))['eval']:
+        X = np.load(os.path.join(data, 'eval', e['name'] + '.npz'))['X_clean']
+        z = np.load(os.path.join(ext3, 'eval', e['name'] + '.npz'))
+        d = X.shape[1]
+        res = {}
+        for st in m3['settings']:
+            m, u, g = z[f'{st}__cellmodel'], z[f'{st}__cellmult'], z[f'{st}__group']
+            reps, counts = z[f'{st}__replicates'][:, :d], z[f'{st}__counts'][:, :d]
+            xb = X.copy()  # exact cells (m = -1) keep their value
+            # one oracle block per (model, scale, group): the oracle knows each cell's model, scale and the group
+            for mi, mu in sorted({(int(a), float(b)) for a, b in zip(m.ravel(), u.ravel()) if a >= 0}):
+                for gi in np.unique(g):
+                    rows = np.where(g == gi)[0]
+                    cols = np.where(((m == mi) & (u == np.float32(mu)))[rows].any(0))[0]
+                    if len(cols) == 0:
+                        continue
+                    pm = posterior_mean(X[:, cols], reps[:, cols], counts[:, cols], MODELS[mi], mu, rows)
+                    blk = ((m == mi) & (u == np.float32(mu)))[np.ix_(rows, cols)]
+                    sub = xb[np.ix_(rows, cols)]
+                    xb[np.ix_(rows, cols)] = np.where(blk, pm, sub)
+            res[f'{st}__bayes'] = np.concatenate([xb, g[:, None].astype(X.dtype)], 1) if st.endswith('_vis') else xb
+        np.savez_compressed(os.path.join(out, e['name'] + '.npz'), **res)
+        print(e['name'], flush=True)
+
+
 if __name__ == '__main__':
     import sys
-    if 'new' in sys.argv:
+    if 'ext3' in sys.argv:
+        main_ext3()
+    elif 'new' in sys.argv:
         main_new(sys.argv[sys.argv.index('new') + 1].split(','))
     else:
         main_ext2() if 'ext2' in sys.argv else main()

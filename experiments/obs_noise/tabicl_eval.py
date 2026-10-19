@@ -12,6 +12,8 @@ from obs_eval import settings_for, DATA, SRC_DIR, BayesLookup, save_probs, PROBS
 from reg_metrics import reg_metrics, TAUS  # noqa: E402
 
 ARMS = ['mean', 'median', 'full', 'bayes']
+N_EST = int(os.environ.get('N_EST', 8))  # TabICL ensemble size (default 8); != 8 -> model tag tabicl_<arm>_e<N_EST>
+SUFFIX = '' if N_EST == 8 else f'_e{N_EST}'
 
 
 def main():
@@ -24,7 +26,7 @@ def main():
     arms = sys.argv[1].split(',') if len(sys.argv) > 1 else ARMS  # optional: subset of arms (parallel runs)
     sources = sys.argv[2].split(',') if len(sys.argv) > 2 else ['main', 'ext']
     for arm in arms:
-        probs_dir = os.path.join(PROBS, f'tabicl_{arm}')
+        probs_dir = os.path.join(PROBS, f'tabicl_{arm}{SUFFIX}')
         os.makedirs(probs_dir, exist_ok=True)
         for e in manifest['eval']:
             pf = os.path.join(probs_dir, e['name'] + '.npz')
@@ -48,16 +50,16 @@ def main():
                     else:
                         Xa = z[f'{s}__{arm}']
                     if task == 'regression':
-                        reg = TabICLRegressor(random_state=0, device='cuda').fit(Xa[tr], y[tr])
+                        reg = TabICLRegressor(random_state=0, device='cuda', n_estimators=N_EST).fit(Xa[tr], y[tr])
                         q = np.asarray(reg.predict(Xa[te], output_type='quantiles', alphas=list(TAUS)))
                         m, u = reg_metrics(q, y[te])
                         saved[f'p__{s}'] = np.sort(q, 1).astype(np.float16)
                         saved[f'u__{s}'] = u.astype(np.float32)
-                        recs.append(dict(model=f'tabicl_{arm}', task=task, source=src, dataset=e['name'], noise=s, **m))
+                        recs.append(dict(model=f'tabicl_{arm}{SUFFIX}', task=task, source=src, dataset=e['name'], noise=s, **m))
                         continue
-                    p = predict(ckpt, Xa[tr], y[tr], Xa[te])
+                    p = predict(ckpt, Xa[tr], y[tr], Xa[te], N_EST)
                     saved[f'p__{s}'] = p.astype(np.float32)
-                    recs.append(dict(model=f'tabicl_{arm}', source=src, dataset=e['name'], noise=s, **metrics(y[te], p)))
+                    recs.append(dict(model=f'tabicl_{arm}{SUFFIX}', source=src, dataset=e['name'], noise=s, **metrics(y[te], p)))
             with open(out, 'a') as f:  # metrics first; a rerun after a crash appends duplicates (analysis keeps last)
                 for r in recs:
                     f.write(json.dumps(r) + '\n')

@@ -3,7 +3,9 @@
 Settings: 'main' = clean + the 9 noise models (artifacts/data); 'ext' = n20/n50 + grouped (artifacts/data_ext).
 Input per checkpoint mode: clean/mean -> cell means; median -> cell medians; stats -> the stored `<s>__full` columns;
 obs -> replicates + counts. With --input bayes, clean/mean checkpoints get the Bayes-oracle posterior means instead.
-One forward pass per dataset, no ensembling. Holdout probabilities are saved to artifacts/probs/<tag>/<dataset>.npz.
+One forward pass per dataset by default; --n_ens N averages N members, TabICL-style: member i uses a random column
+permutation (i = 0: identity) and the class labels shifted cyclically by i (classification), predictions mapped back
+and averaged (probabilities; sorted quantiles for regression). Holdout probabilities are saved to artifacts/probs/<tag>/<dataset>.npz.
 """
 import argparse, json, os, sys
 
@@ -17,8 +19,10 @@ from obs_train import make_model  # noqa: E402
 from reg_metrics import reg_metrics  # noqa: E402
 from gen_data import NOISE_MODELS as NOISES, art, TAG  # noqa: E402
 
-DATA, EXT, EXT2, BAYES, BAYES2, PROBS = (art(p) for p in ('data', 'data_ext', 'data_ext2', 'bayes', 'bayes_ext2', 'probs'))
-SRC_DIR = {'main': DATA, 'ext': EXT, 'ext2': EXT2}
+DATA, EXT, EXT2, EXT3, BAYES, BAYES2, BAYES3, PROBS = (art(p) for p in ('data', 'data_ext', 'data_ext2', 'data_ext3', 'bayes',
+                                                                         'bayes_ext2', 'bayes_ext3', 'probs'))
+SRC_DIR = {'main': DATA, 'ext': EXT, 'ext2': EXT2, 'ext3': EXT3}
+ENS_SEED = 4242
 
 
 # Exp 6 core suite: redundant settings dropped (t3, two-sided censoring, value-dependent gauss/cauchy and plain left
@@ -28,7 +32,8 @@ CORE_NOISE = ['gauss', 'cauchy', 'cauchy_hetero', 'censored_left_heavy', 'fail_f
 CURVE_NOISE = ['gauss', 'cauchy', 'censored_left_heavy']
 CORE = {'main': ['clean'] + CORE_NOISE,
         'ext': [f'{nm}_n{k}' for nm in CURVE_NOISE for k in (20, 50)] + ['grouped', 'grouped_clean'],
-        'ext2': [f'{nm}_{s}' for nm in CURVE_NOISE for s in ('k1', 'k2', 'k3', 'k5', 'k10', 'mix', 'ctx10_q1', 'ctx1_q10')]}
+        'ext2': [f'{nm}_{s}' for nm in CURVE_NOISE for s in ('k1', 'k2', 'k3', 'k5', 'k10', 'mix', 'ctx10_q1', 'ctx1_q10')],
+        'ext3': ['percol', 'pergroup', 'pergroup_vis', 'colgroup_vis']}
 
 
 def settings_for(source):
@@ -41,7 +46,7 @@ def settings_for(source):
 
 class BayesLookup:  # oracle posterior means from artifacts/bayes (main + ext) and artifacts/bayes_ext2
     def __init__(self, name):
-        self.z = [np.load(os.path.join(d, name + '.npz')) for d in (BAYES, BAYES2) if os.path.exists(os.path.join(d, name + '.npz'))]
+        self.z = [np.load(os.path.join(d, name + '.npz')) for d in (BAYES, BAYES2, BAYES3) if os.path.exists(os.path.join(d, name + '.npz'))]
 
     def __getitem__(self, key):
         return next(z[key] for z in self.z if key in z.files)
@@ -73,8 +78,30 @@ def inputs(z, s, mode, variant, zb, dev, X_main):
     return t(reps), torch.tensor(mask, device=dev)[None]
 
 
+def permute_cols(inp, perm, mode):  # column permutation of every input tensor (stats: blocks of 6 columns per feature)
+    return [a.unflatten(-1, (-1, 6))[:, :, perm].flatten(-2) if mode == 'stats' else a[:, :, perm] for a in inp]
+
+
+def ens_predict(model, inp, y_in, mode, task, k, n_ens):
+    """-> probabilities (T, k) or sorted quantiles (T, NQ), averaged over n_ens members (n_ens = 1: one plain pass)."""
+    n_cols = inp[0].shape[2] // (6 if mode == 'stats' else 1)
+    acc = 0.0
+    for i in range(n_ens):
+        perm = np.arange(n_cols) if i == 0 else np.random.default_rng([ENS_SEED, i]).permutation(n_cols)
+        shift = 0 if task == 'regression' else i % k
+        x = permute_cols(inp, torch.tensor(perm, device=inp[0].device), mode)
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            logits = model(*x, y_in if shift == 0 else (y_in + shift) % k)
+        if task == 'regression':
+            acc = acc + np.sort(logits[0].float().cpu().numpy(), 1)
+        else:  # label c was fed as (c + shift) % k
+            p = torch.softmax(logits[0, :, :k].float(), -1).cpu().numpy().astype(np.float64)
+            acc = acc + p[:, (np.arange(k) + shift) % k]
+    return acc / n_ens
+
+
 @torch.no_grad()
-def evaluate(ckpt_path, out_path, tag, sources, variant=None):
+def evaluate(ckpt_path, out_path, tag, sources, variant=None, n_ens=1):
     dev = 'cuda'
     ck = torch.load(ckpt_path, map_location=dev, weights_only=False)
     mode = ck['mode']
@@ -96,23 +123,22 @@ def evaluate(ckpt_path, out_path, tag, sources, variant=None):
         else:
             k = int(y.max()) + 1
             y_in = torch.tensor(y[tr], device=dev)[None]
+        k = None if task == 'regression' else k
         saved = dict(y_test=y[te])
         for src in sources:
             for s in settings_for(src):
                 inp = [a[:, order] for a in inputs(zs[src], s, mode, variant, zb, dev, zs['main']['X_clean'])]
-                with torch.autocast('cuda', dtype=torch.bfloat16):
-                    logits = model(*inp, y_in)
+                pred = ens_predict(model, inp, y_in, mode, task, k, n_ens)
                 base = dict(model=tag, ckpt=os.path.relpath(ckpt_path, ROOT), step=ck['step'], mode=mode, task=task,
-                            input=variant or 'default', source=src, dataset=e['name'], noise=s)
+                            input=variant or 'default', source=src, dataset=e['name'], noise=s, n_ens=n_ens)
                 if task == 'regression':
-                    q = logits[0].float().cpu().numpy()
+                    q = pred
                     m, u = reg_metrics(q, y[te])
                     saved[f'p__{s}'] = np.sort(q, 1).astype(np.float16)
                     saved[f'u__{s}'] = u.astype(np.float32)
                     recs.append(dict(base, **m))
                     continue
-                p = torch.softmax(logits[0, :, :k].float(), -1).cpu().numpy().astype(np.float64)
-                p = np.clip(p, 1e-7, 1)
+                p = np.clip(pred, 1e-7, 1)
                 p /= p.sum(1, keepdims=True)
                 saved[f'p__{s}'] = p.astype(np.float32)
                 recs.append(dict(base, acc=accuracy_score(y[te], p.argmax(1)), log_loss=log_loss(y[te], p, labels=np.arange(k)),
@@ -130,10 +156,11 @@ if __name__ == '__main__':
     ap.add_argument('--out', default=os.path.join(ROOT, 'artifacts', 'pretrain_eval_final.jsonl'))
     ap.add_argument('--sources', default='main', help='comma-separated: main, ext, ext2')
     ap.add_argument('--input', default=None, choices=[None, 'bayes'])
+    ap.add_argument('--n_ens', type=int, default=1, help='ensemble members (column permutations x class shifts)')
     args = ap.parse_args()
     for spec in args.ckpts:
         tag, path = spec.split('=', 1)
-        recs = evaluate(path, args.out, tag, args.sources.split(','), args.input)
+        recs = evaluate(path, args.out, tag, args.sources.split(','), args.input, args.n_ens)
         by = {}
         for r in recs:
             by.setdefault(r['noise'], []).append(r['acc'] if 'acc' in r else r['crps'])
