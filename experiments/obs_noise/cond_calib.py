@@ -6,7 +6,7 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 MAN = json.load(open(os.path.join(ROOT, 'artifacts', 'data', 'manifest.json')))['eval']
-NOISES = ['gauss', 'cauchy', 'cauchy_hetero', 'censored_left_heavy']
+NOISES = ['gauss', 'cauchy', 'censored_left_heavy']  # core-suite curve models
 models = sys.argv[1].split(',')
 cols = [('mix', 'single'), ('mix', 'repl'), ('ctx10_q1', 'all'), ('ctx1_q10', 'all')]
 for nm in NOISES:

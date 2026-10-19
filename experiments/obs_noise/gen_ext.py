@@ -12,7 +12,7 @@ import json, os, warnings
 
 import numpy as np
 
-from gen_data import NOISE_MODELS, FEATURE_ARMS, SEED_NOISE, observe, summarize
+from gen_data import NOISE_MODELS, FEATURE_ARMS, SEED_NOISE, observe, summarize, art
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 N_FIXED = [20, 50]
@@ -33,8 +33,7 @@ def featurize(arrays, s, reps, counts):
 
 
 def main():
-    data = os.path.join(ROOT, 'artifacts', 'data')
-    out = os.path.join(ROOT, 'artifacts', 'data_ext')
+    data, out = art('data'), art('data_ext')
     os.makedirs(os.path.join(out, 'eval'), exist_ok=True)
     m = json.load(open(os.path.join(data, 'manifest.json')))
     for e in m['eval']:

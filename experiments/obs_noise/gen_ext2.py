@@ -10,7 +10,7 @@ import json, os, warnings
 
 import numpy as np
 
-from gen_data import observe, summarize, FEATURE_ARMS
+from gen_data import observe, summarize, FEATURE_ARMS, art
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 NOISES = ['gauss', 'student_t3', 'cauchy', 'cauchy_hetero', 'censored_left_heavy']
@@ -29,8 +29,7 @@ def featurize(arrays, s, reps, counts):
 
 
 def main():
-    data = os.path.join(ROOT, 'artifacts', 'data')
-    out = os.path.join(ROOT, 'artifacts', 'data_ext2')
+    data, out = art('data'), art('data_ext2')
     os.makedirs(os.path.join(out, 'eval'), exist_ok=True)
     m = json.load(open(os.path.join(data, 'manifest.json')))
     for e in m['eval']:

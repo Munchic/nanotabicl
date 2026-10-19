@@ -22,6 +22,8 @@ for arm in "$@"; do
     p2_obs_attn_mf)        ./supervise.sh $P$arm $OBS --rep_cfg '{"center": "attn", "med_feat": true}' ;;
     p2_obs_attn_mf_lr10)   ./supervise.sh $P$arm $OBS --rep_cfg '{"center": "attn", "med_feat": true}' --rep_lr_mult 10 ;;
     p2_obs_attn_mf_nosab)  ./supervise.sh $P$arm $OBS --rep_cfg '{"center": "attn", "med_feat": true, "use_sab": false}' ;;
+    p2_obs_attn_mf_rstd)    ./supervise.sh $P$arm $OBS --rep_cfg '{"center": "attn", "med_feat": true, "std": "medmad", "zclip": 10.0}' ;;
+    p2_obs_attn_mf_rstd_rf) ./supervise.sh $P$arm $OBS --rep_cfg '{"center": "attn", "med_feat": true, "std": "medmad", "zclip": 10.0, "robust_feats": true}' ;;
     p2_obs_frozen)         ./supervise.sh $P$arm $OBS --freeze_backbone ;;
     *) echo "unknown arm $arm"; exit 1 ;;
   esac

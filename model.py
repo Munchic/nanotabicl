@@ -28,7 +28,8 @@ class NanoTabICLv2(nn.Module):
         self.out_ln = nn.LayerNorm(icl_dim)
         self.out_mlp = get_mlp(icl_dim, icl_dim * 2, out_dim)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, extra_emb: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y: torch.Tensor, extra_emb: typing.Optional[torch.Tensor] = None,
+                extra_row_emb: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
         n_batch, n_rows, n_cols = x.shape
         n_batch, n_train = y.shape
 
@@ -51,6 +52,8 @@ class NanoTabICLv2(nn.Module):
             emb = block.row_attn(emb)
         emb = self.row_blocks[-1].row_attn(emb, q_max_idx=self.row_cls_tokens.size(-2))  # need only the cls token values
         emb = self.row_ln(emb).flatten(-2, -1)  # norm + merge cls tokens into one bigger token
+        if extra_row_emb is not None:  # optional per-row embedding, e.g. row reliability (obs_model.py)
+            emb = emb + extra_row_emb
 
         # ----- TF_icl: add y embedding -> self-attention
         # now emb.shape = (n_batch, n_rows, icl_dim)
