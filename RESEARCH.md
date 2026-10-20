@@ -1319,3 +1319,69 @@ Without the center term, the auxiliary loss does nothing useful. **Conclusion fo
 | `stock_reg` final | **0.701** | 0.183 |
 
 Mixed, and below the stop rule (R²). The R² trajectory was flat from 17k (0.693), so the longer schedule buys the regression backbone little at this size. The classification gain (+1.1 to +1.4 points clean) does not carry over to regression.
+
+### 7f result. Column-context encoder (`p7_obs_dist_temp_col`, `r7_obs_dist_temp_col`), 27 eval datasets
+
+| | main (10) | het (4) | Δ vs matched median, main (8 passes) | Δ vs p5 / r5, main (8 passes) |
+|---|---|---|---|---|
+| classification, 8 passes | **0.646** acc | 0.637 | **+1.3 ± 0.2 (24/27)** | +0.2 |
+| regression, 8 passes | **0.269** CRPS | 0.275 | **−0.026 ± 0.003 (27/27)** | −0.007 |
+
+- **The best 1M model in both tasks.**
+- **Classification:** it equals TabICLv2 + median on the main settings (0.646 = 0.646).
+- **Regression:**
+  - main settings: it beats TabICLv2 + median (0.269 vs 0.278) and matches nano with Bayes-oracle input (0.268);
+  - PIT error: 0.028 / 0.030 (1 / 8 passes), the best of the nano models;
+  - clean: unchanged.
+- Unlike aux, it helps both failure modes and the heavy-tail settings. **`col_ctx` is adopted** for the TabICLv2 port.
+
+---
+
+## Exp 8 — Replicate branch on the pretrained TabICLv2 (27.55M) backbone (2026-10-19, running)
+
+**Port ([tabicl_port.py](tabicl_port.py)).**
+- `load_tabicl(task)` maps the released checkpoints onto `NanoTabICLv2` / `ObsNanoTabICL`.
+- Two differences were found and fixed while verifying:
+  1. **Feature grouping offset.** TabICL groups feature i with i + 1, i + 2, i + 4; nano with i, i + 1, i + 3. The groups are the same, but the column order is shifted by one, which changes the row-RoPE positions. New `NanoTabICLv2(group_shift=…)`: 1 = nano (default, existing checkpoints unchanged), 0 = TabICL.
+  2. **Bias-free LayerNorms** in the regression checkpoint: loaded as zero biases (exactly equivalent).
+- **Verified:** nano equals `TabICL._train_forward` to ≤ 2.6e-4 (fp32, 3–16 features, both tasks; `python tabicl_port.py`).
+- TabICL's own eval-mode path differs from its training path by 0.01–0.07, through a separate column-embedder inference code path. An earlier "match" (fp16, 4e-3 in probabilities) was hiding the grouping offset.
+
+**Pipeline.**
+- [obs_train.py](experiments/obs_noise/obs_train.py) `--arch tabicl`: 27.55M config, released weights as init.
+- Regression head: 999 quantiles (levels k / 1000) for training. [obs_eval.py](experiments/obs_noise/obs_eval.py) uses every 10th, i.e. levels k / 100, matching nano.
+- `--freeze_backbone` now sets `requires_grad=False` on the backbone.
+- Cheap frequent validation: `--val_blocks 4`, 7 noise settings, every 250 steps; training loss every 25 steps (`--log_every`).
+
+**Reference: TabICLv2 + median through our pipeline** (raw module, nano's column standardization, 1 pass), vs the sklearn wrapper with 1 estimator (which adds its own preprocessing):
+- Equal within ±0.4 on most settings.
+- Lower on clean (−1.1 ± 0.8), heavy left-censoring (**−3.5**), detection dropout (−1.0) and `fail_floor` (−0.7). The wrapper's preprocessing helps with point masses at a limit.
+- Matched comparisons use our pipeline throughout. The wrapper numbers are reported alongside.
+
+**Stage A (running, [phase_tx.sh](experiments/obs_noise/phase_tx.sh)).**
+- Frozen backbone, branch only (p7 column-context config).
+- 6000 steps, lr 3e-4, v2 mixture with count regimes, both tasks.
+- About 1.3 s/step with two runs sharing the GPU.
+- Monitored every 250 steps against the TabICLv2 + median reference ([monitor_tx.py](experiments/obs_noise/monitor_tx.py)).
+- Step 0 (= TabICLv2 on cell means): noisy validation accuracy −1.6 points vs median (Cauchy −6.1, censoring +2.3).
+
+**Median start (`center: 'attn_med'`).**
+- The center fed to the backbone is median + 10·α·(attention center − median), with α zero-initialized. The median is numpy's linear median, the same arithmetic as the baseline's `masked_quantile`.
+- **Step 0 equals TabICLv2 + median imputation exactly:** max |Δ| = 0.0 on logits and quantiles, both tasks, with all other branch maps at their zero init. Every validation point is therefore a direct "gain over median" readout.
+- α gets a gradient immediately, and the attention scores learn once it moves. All-single tables still equal TabICLv2 exactly with every map randomized.
+- **Why not a saturated softmax on −|z − median|:** it also gives the exact median, but it passes almost no gradient to the learned scores.
+- **Why not Huber / trimmed mean:** a better neutral start in principle, but it would need its own matched imputation baseline. On LINCS-like noise (t₂–Cauchy tails, 2–3% outliers) it behaves like the median anyway.
+- **Runs:** `tx_obs_colmed_A[_reg]`, same budget as stage A, queued after it ([phase_tx2.sh](experiments/obs_noise/phase_tx2.sh)). Stage B will use the median start in any case, so that early backbone gradients are not spent adapting to mean-imputed inputs.
+
+**Optimizer for stage B: Muon, to match TabICLv2's pretraining** ([muon.py](muon.py), vendored from `tabicl.train._muon`, BSD-3).
+- TabICL's training code puts all parameters in one Muon group: non-2D ones reshaped, `matched_adamw_rms=0.2` (lr on the AdamW scale), Nesterov, momentum β₁ = 0.9, weight decay 0 by default. Its config notes that the released checkpoints were trained with Muon's cautious-WD option off, i.e. with Muon.
+- `obs_train.py --optim muon`:
+  - backbone: that Muon group, `--muon_wd` 0;
+  - replicate branch: Muon's internal AdamW (β = 0.9 / 0.95, wd 0.01), as in stage A.
+  - CPU-checked: loss decreases, the gate moves, and the optimizer state round-trips through `state_dict`.
+- **Stage A stays on AdamW:** the backbone is frozen, so there is no mismatch, and the branch is small (mostly vectors, LayerNorms and the scalar gate).
+- **Stage B ([phase_txB.sh](experiments/obs_noise/phase_txB.sh)):**
+  - start from the better stage-A run;
+  - backbone lr 1.5e-5 (warmup 200, cosine to 10%); branch lr 20× that = 3e-4;
+  - 4000 steps;
+  - matched baseline `tx_median_B`: TabICLv2 + median imputation, continued with the same optimizer, steps and data.

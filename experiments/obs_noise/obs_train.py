@@ -15,6 +15,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, '..', '..'))
 from model import NanoTabICLv2  # noqa: E402
 from obs_model import ObsNanoTabICL  # noqa: E402
+from tabicl_port import load_tabicl  # noqa: E402
 
 K = 10
 NOISES = ['gauss', 'student_t3', 'censored', 'cauchy', 'cauchy_hetero',
@@ -23,6 +24,7 @@ NOISES_V2 = NOISES + ['fail_floor', 'fail_shift', 'cv_lognormal', 'lod_logistic'
 TRAIN_NOISES = NOISES  # set by --noise_set; v1 keeps the original training mixture and RNG stream
 N_VAL = 16
 VAL_CHUNK = 8
+VAL_BLOCKS, VAL_NOISES = N_VAL, None  # --val_blocks / --val_noises: cheaper validation (e.g. for the 27M model)
 MODEL_CFG = dict(max_classes=10, out_dim=10, embed_dim=32, col_num_blocks=2, row_num_blocks=2, icl_num_blocks=6,
                  col_nhead=4, row_nhead=4, icl_nhead=4, n_cls_rows=32)  # ~1M params (NOTES.md compute budget)
 
@@ -201,18 +203,26 @@ def summary_stats(reps, mask):  # -> (B, R, C*6): x0_mean, x0_median, x0_sd, x0_
     return torch.stack([mean, med, sd, iqr, sd / n.sqrt(), n.log()], dim=-1).flatten(-2)
 
 
-NQ = 99  # regression: predicted quantile levels tau_k = k / (NQ + 1)
+NQ = 99  # regression: predicted quantile levels tau_k = k / (NQ + 1); the TabICLv2 head has 999 (set in main)
 TAUS = torch.arange(1, NQ + 1) / (NQ + 1)
 TASK = 'classification'  # set by main() / make_model(task=...)
+ARCH = 'nano'  # 'nano' (~1M, MODEL_CFG) or 'tabicl' (27.55M, the released TabICLv2 weights via tabicl_port.py)
 
 
-def model_cfg(task):
+def model_cfg(task, arch=None):
+    if (arch or ARCH) == 'tabicl':
+        return load_tabicl(task)[0]
     return MODEL_CFG if task == 'classification' else dict(MODEL_CFG, max_classes=0, out_dim=NQ)
 
 
-def make_model(mode, rep_cfg, task='classification'):
-    cfg = model_cfg(task)
+def make_model(mode, rep_cfg, task='classification', cfg=None):
+    cfg = cfg or model_cfg(task)
     return ObsNanoTabICL(**cfg, **rep_cfg) if mode == 'obs' else NanoTabICLv2(**cfg)
+
+
+def set_quantiles(nq):  # regression head size: 99 (nano) or 999 (TabICLv2); levels k / (nq + 1)
+    global NQ, TAUS
+    NQ, TAUS = nq, torch.arange(1, nq + 1) / (nq + 1)
 
 
 def standardize_y(y, n_train):  # regression: per-table standardization with the context targets
@@ -292,8 +302,8 @@ def ce_loss(logits, y_test):
 def validate(model, mode, bank, dev):
     model.eval()
     out = {}
-    files = bank.files()[:N_VAL]
-    settings = [('clean', None)] + [(nm, nm) for nm in TRAIN_NOISES]
+    files = bank.files()[:VAL_BLOCKS]
+    settings = [('clean', None)] + [(nm, nm) for nm in (VAL_NOISES or TRAIN_NOISES)]
     for name, noise in settings:
         g = torch.Generator(device=dev).manual_seed(12345)
         losses, accs = [], []
@@ -366,10 +376,21 @@ def main():
                                                   'empty = one model per table (original stream)')
     ap.add_argument('--group_vis_prob', type=float, default=0.5, help='group layouts: share of batches with the group column')
     ap.add_argument('--aux_w', type=float, default=0.0, help='obs: weight of the auxiliary denoising loss (needs rep_cfg aux)')
+    ap.add_argument('--arch', choices=['nano', 'tabicl'], default='nano', help='tabicl: TabICLv2 (27.55M) backbone; '
+                    'without --init it starts from the released checkpoint (tabicl_port.py)')
+    ap.add_argument('--val_blocks', type=int, default=N_VAL, help='validation blocks (<= N_VAL)')
+    ap.add_argument('--val_noises', default='', help='comma-separated validation noise models (default: the training set)')
+    ap.add_argument('--log_every', type=int, default=0, help='also log the running train loss every N steps')
+    ap.add_argument('--optim', choices=['adamw', 'muon'], default='adamw', help='muon: backbone with TabICLv2\'s Muon')
+    ap.add_argument('--muon_wd', type=float, default=0.0, help='Muon weight decay (tabicl.train default 0)')
     args = ap.parse_args()
     dev = 'cuda'
-    global TASK, TRAIN_NOISES
-    TASK = args.task
+    global TASK, TRAIN_NOISES, ARCH, VAL_BLOCKS, VAL_NOISES
+    TASK, ARCH = args.task, args.arch
+    VAL_BLOCKS = min(args.val_blocks, N_VAL)
+    VAL_NOISES = args.val_noises.split(',') if args.val_noises else None
+    if ARCH == 'tabicl' and TASK == 'regression':
+        set_quantiles(load_tabicl('regression')[0]['out_dim'])
     TRAIN_NOISES = NOISES_V2 if args.noise_set == 'v2' else NOISES
     regimes = json.loads(args.regimes) if args.regimes else None
     layouts = (lambda w: np.asarray(w) / np.sum(w))(json.loads(args.layouts)) if args.layouts else None
@@ -387,18 +408,32 @@ def main():
 
     rep_cfg = json.loads(args.rep_cfg)
     model = make_model(args.mode, rep_cfg, args.task).to(dev)
-    if args.init:
-        missing, unexpected = model.load_state_dict(torch.load(args.init, map_location=dev)['state_dict'], strict=False)
+    if args.init or ARCH == 'tabicl':
+        sd = torch.load(args.init, map_location=dev)['state_dict'] if args.init else load_tabicl(TASK)[1]
+        missing, unexpected = model.load_state_dict(sd, strict=False)
         assert not unexpected and all(k.startswith('rep_') for k in missing), (missing, unexpected)
+    if args.freeze_backbone:  # no weight gradients for the backbone at all (saves memory and backward time)
+        for n, p in model.named_parameters():
+            p.requires_grad_(n.startswith('rep_'))
     params = [p for n, p in model.named_parameters() if not args.freeze_backbone or n.startswith('rep_')]
     rep = [p for n, p in model.named_parameters() if n.startswith('rep_')]
     rest = [p for n, p in model.named_parameters() if not n.startswith('rep_') and not args.freeze_backbone]
     groups = [g for g in [dict(params=rest, lr=args.lr), dict(params=rep, lr=args.lr * args.rep_lr_mult)] if g['params']]
     if args.rep_lr_mult == 1.0:  # single group == the original optimizer layout (keeps old checkpoints resumable)
         groups = params
-    opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
+    if args.optim == 'muon':  # TabICLv2's own optimizer for the backbone (tabicl.train: one Muon group for all its
+        # parameters, matched_adamw_rms 0.2, Nesterov, momentum beta1, wd 0); the replicate branch stays on AdamW
+        # (Muon's internal AdamW, our betas / wd), as in stage A
+        from muon import Muon
+        groups = [g for g in [dict(params=rest, lr=args.lr, use_muon=True, weight_decay=args.muon_wd),
+                              dict(params=rep, lr=args.lr * args.rep_lr_mult, use_muon=False, weight_decay=0.01)]
+                  if g['params']]
+        opt = Muon(groups, lr=args.lr, weight_decay=args.muon_wd, matched_adamw_rms=0.2, momentum=0.9, nesterov=True,
+                   ns_steps=5, adamw_betas=(0.9, 0.95), adamw_eps=1e-8)
+    else:
+        opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1, (s + 1) / args.warmup) *
-                                              (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1, s / args.steps)))))
+                                              (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(1, s / max(args.steps, 1))))))
     bank = Bank(args.bank, args.n_blocks or None)
     start = 0
     last = os.path.join(out_dir, 'last.ckpt')
@@ -419,7 +454,7 @@ def main():
             print(f"step {step:6d} {rec['time']:6.0f}s train {rec['train_loss'] or float('nan'):.4f} | " +
                   ' '.join(f"{k} {x['acc']:.3f}/{x['loss']:.3f}" for k, x in v.items()), flush=True)
             run_loss = []
-            torch.save(dict(state_dict=model.state_dict(), model_cfg=model_cfg(args.task), rep_cfg=rep_cfg, mode=args.mode, task=args.task,
+            torch.save(dict(state_dict=model.state_dict(), model_cfg=model_cfg(args.task), arch=ARCH, rep_cfg=rep_cfg, mode=args.mode, task=args.task,
                             step=step, args=vars(args), opt=opt.state_dict(), sched=sched.state_dict(),
                             np_rng=rng.bit_generator.state, torch_rng=g.get_state()), last + '.tmp')
             os.replace(last + '.tmp', last)
@@ -469,6 +504,9 @@ def main():
         opt.step()
         sched.step()
         run_loss.append(loss.item())
+        if args.log_every and (step + 1) % args.log_every == 0 and (step + 1) % args.val_every:
+            log.write(json.dumps(dict(step=step + 1, time=time.time() - t0, train_loss=float(np.mean(run_loss[-args.log_every:])))) + '\n')
+            log.flush()
 
 
 if __name__ == '__main__':

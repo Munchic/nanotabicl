@@ -92,8 +92,9 @@ def ens_predict(model, inp, y_in, mode, task, k, n_ens):
         x = permute_cols(inp, torch.tensor(perm, device=inp[0].device), mode)
         with torch.autocast('cuda', dtype=torch.bfloat16):
             logits = model(*x, y_in if shift == 0 else (y_in + shift) % k)
-        if task == 'regression':
-            acc = acc + np.sort(logits[0].float().cpu().numpy(), 1)
+        if task == 'regression':  # a 999-quantile head (TabICLv2, levels k / 1000) -> our 99 levels k / 100
+            q = np.sort(logits[0].float().cpu().numpy(), 1)
+            acc = acc + (q[:, 9::10] if q.shape[1] == 999 else q)
         else:  # label c was fed as (c + shift) % k
             p = torch.softmax(logits[0, :, :k].float(), -1).cpu().numpy().astype(np.float64)
             acc = acc + p[:, (np.arange(k) + shift) % k]
@@ -106,7 +107,7 @@ def evaluate(ckpt_path, out_path, tag, sources, variant=None, n_ens=1):
     ck = torch.load(ckpt_path, map_location=dev, weights_only=False)
     mode = ck['mode']
     task = ck.get('task', 'classification')
-    model = make_model(mode, ck['rep_cfg'], task).to(dev).eval()
+    model = make_model(mode, ck['rep_cfg'], task, cfg=ck.get('model_cfg')).to(dev).eval()
     model.load_state_dict(ck['state_dict'])
     manifest = json.load(open(os.path.join(DATA, 'manifest.json')))
     probs_dir = os.path.join(PROBS, tag)

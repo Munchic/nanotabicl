@@ -9,7 +9,7 @@ K = ['clean', 'gauss', 'cauchy', 'cauchy_hetero', 'censored_left_heavy', 'fail_f
 
 def logv(name):
     p = os.path.join(ROOT, 'artifacts', 'pretrain', name, 'log.jsonl')
-    return {r['step']: r['val'] for r in map(json.loads, open(p))} if os.path.exists(p) else {}
+    return {r['step']: r['val'] for r in map(json.loads, open(p)) if 'val' in r} if os.path.exists(p) else {}
 
 
 for run, ref, m in [('p7_obs_dist_temp_col', 'p5_obs_dist_temp', 'acc'), ('r7_obs_dist_temp_col', 'r5_obs_dist_temp', 'loss'),

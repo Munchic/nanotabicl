@@ -87,6 +87,16 @@ def col_quantile(v: torch.Tensor, q: float) -> torch.Tensor:  # (B, R, C) -> (B,
     return srt[:, lo:lo + 1] + (pos - lo) * (srt[:, hi:hi + 1] - srt[:, lo:lo + 1])
 
 
+def linear_median(v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """numpy-style (linear interpolation) median over valid entries of the last dim; same arithmetic as
+    obs_train.masked_quantile(v, mask, 0.5), so median-start models equal median imputation at step 0."""
+    srt = torch.where(mask, v, float('inf')).sort(dim=-1).values
+    pos = 0.5 * (mask.sum(-1, keepdim=True) - 1).clamp(min=0).to(v.dtype)
+    lo, hi = pos.floor().long(), pos.ceil().long()
+    v_lo, v_hi = srt.gather(-1, lo), srt.gather(-1, hi)
+    return (v_lo + (pos - lo) * (v_hi - v_lo)).squeeze(-1)
+
+
 def masked_median(v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:  # lower median over valid entries (last dim)
     srt = torch.where(mask, v, float('inf')).sort(dim=-1).values
     return srt.gather(-1, ((mask.sum(-1) - 1).clamp(min=0) // 2)[..., None]).squeeze(-1)
@@ -129,8 +139,13 @@ class ObsNanoTabICL(NanoTabICLv2):
         # per-cell value fed to the backbone (n = 1 -> x in all cases): 'mean' (= imputation, the spec), 'median'
         # (robust), 'attn' (learned attention-weighted location over replicates; zero-init scores -> starts at the mean)
         self.center = center
+        # 'attn_med': median start. center = median + ALPHA_SCALE * rep_alpha * (attention center - median), rep_alpha
+        # zero-init -> step 0 feeds the backbone exactly the (numpy, linear) cell median, i.e. step 0 == median
+        # imputation; the gate gets a gradient at once and the attention scores learn as soon as it moves
+        if center == 'attn_med':
+            self.rep_alpha = nn.Parameter(torch.zeros(1))
         self.rep_enc = ReplicateEncoder(d_s=d_s, n_heads=rep_heads, use_sab=use_sab, use_null=use_null,
-                                        med_feat=med_feat, loc_head=center == 'attn', robust_feats=robust_feats, pool=pool,
+                                        med_feat=med_feat, loc_head=center in ('attn', 'attn_med'), robust_feats=robust_feats, pool=pool,
                                         col_ctx=col_ctx)
         if col_ctx:
             self.rep_col = nn.Sequential(nn.LayerNorm(d_s), nn.Linear(d_s, d_s))
@@ -185,6 +200,7 @@ class ObsNanoTabICL(NanoTabICLv2):
         return out
 
     N_RFF, NU0 = 8, 3.0
+    ALPHA_SCALE = 10.0  # gate parameterization: Adam moves rep_alpha by ~lr per step -> the gate by ~10 lr
     AUX_TAUS = (0.1, 0.25, 0.5, 0.75, 0.9)
 
     def aux_loss(self, x_clean: torch.Tensor) -> torch.Tensor:
@@ -201,7 +217,7 @@ class ObsNanoTabICL(NanoTabICLv2):
         taus = torch.tensor(self.AUX_TAUS, device=q.device)
         diff = zt[:, None] - q
         loss = torch.maximum(taus * diff, (taus - 1) * diff).mean()
-        if self.center == 'attn' and self.aux_center:
+        if self.center in ('attn', 'attn_med') and self.aux_center:
             zc = clip((x_c.float() - mu.float()) / sd.float())[multi]
             loss = loss + (zc - zt).abs().mean()
         return loss
@@ -298,10 +314,14 @@ class ObsNanoTabICL(NanoTabICLv2):
         if multi.any():
             vec, scores = self.rep_enc(z[multi], mask[multi], None if tie is None else tie[multi], ctx_fn=ctx_fn)
             cell[multi] = vec.to(cell.dtype)
-            if self.center == 'attn':  # learned location: softmax-weighted replicates (raw scale), n = 1 cells keep x
+            if self.center in ('attn', 'attn_med'):  # learned location: softmax-weighted replicates (raw scale), n = 1 keep x
                 w = torch.softmax(scores.float().masked_fill(~mask[multi], float('-inf')), dim=-1)
+                att = (w * reps[multi]).sum(-1)
                 x_c = x.clone()
-                x_c[multi] = (w * reps[multi]).sum(-1).to(x.dtype)
+                if self.center == 'attn_med':
+                    med = linear_median(reps[multi], mask[multi])
+                    att = med + self.ALPHA_SCALE * self.rep_alpha.float() * (att - med)
+                x_c[multi] = att.to(x.dtype)
         if self.aux and self.training:  # kept for aux_loss(); mu / sd: (B, 1, C) column standardization
             self._aux_state = (multi, vec, x_c, mu[..., 0], sd[..., 0])
         if self.dist_emb or self.temp_head:
@@ -322,7 +342,8 @@ class ObsNanoTabICL(NanoTabICLv2):
                 e1 = self.rep_single(inp.to(cell.dtype)).to(cell.dtype)  # (B, 1, C, d_s + 1)
                 cell = torch.where(use[..., None], e1.expand_as(cell), cell)
         idxs = torch.arange(n_cols, device=reps.device)
-        grouped = torch.cat([cell[:, :, (idxs + (2 ** i - 1)) % n_cols] for i in range(self.feature_group_size)], dim=-1)
+        grouped = torch.cat([cell[:, :, (idxs + (2 ** i - self.group_shift)) % n_cols]
+                             for i in range(self.feature_group_size)], dim=-1)
         return x_c, self.rep_proj(grouped)
 
 

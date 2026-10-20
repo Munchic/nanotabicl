@@ -5,10 +5,11 @@ class NanoTabICLv2(nn.Module):
     def __init__(self, max_classes: int, out_dim: int, embed_dim: int = 128,
                  col_num_blocks: int = 3, row_num_blocks: int = 3, icl_num_blocks: int = 12,
                  col_nhead: int = 8, row_nhead: int = 8, icl_nhead: int = 8,
-                 feature_group_size: int = 3, n_cls_cols: int = 4, n_cls_rows: int = 128):
+                 feature_group_size: int = 3, n_cls_cols: int = 4, n_cls_rows: int = 128, group_shift: int = 1):
         # classification: max_classes = out_dim (= 10 typically); regression: max_classes = 0, out_dim = n_quantiles
         super().__init__()
         self.feature_group_size = feature_group_size
+        self.group_shift = group_shift  # feature i is grouped with features i + 2^k - group_shift (TabICLv2: 0)
         icl_dim = embed_dim * n_cls_cols
 
         self.x_embed = nn.Linear(feature_group_size, embed_dim)
@@ -36,7 +37,7 @@ class NanoTabICLv2(nn.Module):
         # ----- Embedding: standardize -> repeated feature grouping -> x embedding -> add y embedding to train
         x = (x - x[:, :n_train].mean(dim=1, keepdim=True)) / (x[:, :n_train].std(dim=1, unbiased=False, keepdim=True) + 1e-8)
         idxs = torch.arange(n_cols, dtype=torch.long, device=x.device)
-        x = torch.stack([x[:, :, (idxs + (2 ** i - 1)) % n_cols] for i in range(self.feature_group_size)], dim=-1)
+        x = torch.stack([x[:, :, (idxs + (2 ** i - self.group_shift)) % n_cols] for i in range(self.feature_group_size)], dim=-1)
         emb = self.x_embed(x)  # emb.shape = (n_batch, n_rows, n_cols, embed_dim)
         if extra_emb is not None:  # optional extra per-cell embedding, e.g. from a replicate encoder (obs_model.py)
             emb = emb + extra_emb
