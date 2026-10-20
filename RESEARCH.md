@@ -1385,3 +1385,250 @@ Mixed, and below the stop rule (R²). The R² trajectory was flat from 17k (0.69
   - backbone lr 1.5e-5 (warmup 200, cosine to 10%); branch lr 20× that = 3e-4;
   - 4000 steps;
   - matched baseline `tx_median_B`: TabICLv2 + median imputation, continued with the same optimizer, steps and data.
+
+**Interim 27-dataset eval of stage A (mid-training; frozen TabICLv2 + branch, mean start, 1 pass)**, vs the sklearn wrapper:
+
+| classification (accuracy) | clean | main (10) | het (4) | log-loss main | ECE main | Δ main vs wrapper 1-est. | Δ het vs wrapper |
+|---|---|---|---|---|---|---|---|
+| TabICLv2 wrapper, 1 est. / 8 est. | 0.742 / 0.742 | 0.645 / 0.646 | 0.656 / 0.656 | 0.846 | 0.040 | | |
+| TabICLv2 + median, our pipeline | 0.730 | 0.640 | 0.652 | 0.860 | 0.043 | −0.5 | −0.4 |
+| **stage A, step 2750** | 0.730 | **0.658** | 0.656 | **0.820** | **0.035** | **+1.2 ± 0.2 (25/27)** | +0.0 |
+| TabICLv2 + Bayes-oracle input, wrapper | 0.742 | 0.667 | 0.661 | 0.801 | 0.040 | +2.2 | +0.5 |
+
+| regression (CRPS) | clean | main (10) | het (4) | PIT err main | cov90 main | Δ main vs wrapper 1-est. | Δ het vs wrapper |
+|---|---|---|---|---|---|---|---|
+| TabICLv2 wrapper, 1 est. / 8 est. | 0.125 | 0.278 | 0.262 | 0.024 | 0.900 / 0.903 | | |
+| TabICLv2 + median, our pipeline | 0.128 | 0.279 | 0.263 | 0.026 | 0.887 | +0.001 | +0.000 |
+| **stage A, step 2500** | 0.128 | **0.259** | **0.254** | 0.028 | 0.888 | **−0.019 ± 0.002 (26/27)** | **−0.008 ± 0.002 (23/27)** |
+| TabICLv2 + Bayes-oracle input, wrapper | 0.125 | 0.245 | 0.253 | 0.024 | 0.906 | −0.033 | −0.009 |
+
+- **Halfway through stage A, the frozen-TabICLv2 branch beats the TabICLv2 sklearn wrapper on the main noisy settings in both tasks.**
+- It already captures about 60% of the Bayes-oracle headroom: (0.658 − 0.645) / (0.667 − 0.645) in classification, (0.278 − 0.259) / (0.278 − 0.245) in regression.
+- **Regression het:** −0.008, close to the oracle's −0.009.
+- **Calibration:**
+  - classification is better (ECE 0.035 vs 0.040; log-loss −0.026);
+  - regression PIT error is slightly worse (0.028 vs 0.024), with 90% coverage 0.888, i.e. a little narrow.
+- **The remaining clean gap is our pipeline, not the branch.**
+  - Clean data: 0.730 vs 0.742 (CRPS 0.128 vs 0.125). The wrapper's preprocessing is worth that much on TabICLv2 + median as well.
+  - The branch cannot touch n = 1 data.
+  - The fix: port the wrapper's column preprocessing into the pipeline, or let stage B learn it.
+
+**Target changed to the off-the-shelf wrapper → ported its input preprocessing** (`NanoTabICLv2(preproc='tabicl')`, [model.py](model.py) `tabicl_preprocess`; on for every new TabICLv2-arch run via `tabicl_port.nano_config`).
+- **Which preprocessing.** The wrapper with `n_estimators=1` takes the first ensemble configuration, which uses normalization `'none'`; the Yeo-Johnson branch only enters 8-estimator ensembles. Its per-column pipeline, fitted on the context rows:
+  1. constant-column filter;
+  2. z-score with population sd + 1e-6, clipped to ±100;
+  3. two-stage 4-sd outlier soft clip;
+  4. one random feature / class permutation.
+- **Port:** steps 2–3 in torch, applied to the per-cell value the backbone sees (median, mean or the learned center), fitted on context rows; the replicate encoder keeps its own robust standardization.
+  - **Verified:** equal to `tabicl._sklearn.preprocessing.PreprocessingPipeline('none')` to **2.4e-14**, on the 27 eval datasets × {clean, heavy censoring, Cauchy, `fail_floor`} medians.
+  - **Not ported:** the constant-column filter. Those columns become all-zero instead, and no eval context has one.
+- **Old runs are unaffected.** Checkpoints without `preproc` in their `model_cfg` keep the plain z-score: `tx_median0`, the running mean-start stage A.
+- **Queue ([lanes_preproc.sh](experiments/obs_noise/lanes_preproc.sh)), two lanes, each starting when a running stage-A run frees the GPU:**
+  - **lane 1:** reference `tx_median0p` (TabICLv2 + median with the preprocessing; validation + 27-dataset eval) → median-start stage A `tx_obs_colmed_A` → stage B branch `tx_obs_B` → `tx_obs_B_reg`;
+  - **lane 2:** `tx_median0p_reg` → `tx_median_B` → `tx_obs_colmed_A_reg` → `tx_median_B_reg`.
+  - Stage B starts from the median-start stage A, which now differs from the mean-start run in its preprocessing too, so it is not a pure start-point comparison any more.
+
+**Precision was the remaining gap: bf16 autocast degrades the released TabICLv2.**
+- Diagnosis on the 27 eval datasets, after the preprocessing port:
+  - the TabICL module's eval path, its training path and our port all reproduce the wrapper in fp32 (heavy censoring 0.629–0.630, clean 0.742);
+  - **our model under bf16 autocast: 0.591 / 0.720** (CPU check).
+- TabICL trains with autocast dtype float32 and TF32 matmuls (`tabicl.train` defaults), and runs inference in fp16.
+- **Fix:** `obs_train.py --precision` defaults to fp32 + TF32 for `--arch tabicl` (bf16 kept for the nano runs, which were trained that way). `obs_eval.py` evaluates TabICLv2-arch checkpoints in fp32 + TF32.
+- **Reference, TabICLv2 + median through our pipeline (fp32 + preprocessing, `tx_median0p`) now equals the wrapper 1-est.:**
+  - classification: clean 0.742, main 0.645, het 0.656, heavy censoring 0.630 (wrapper 0.629);
+  - regression: clean 0.126 (0.125), main 0.278, het 0.262;
+  - validation clean accuracy 0.801, vs 0.773 under bf16.
+- **Restarted:** the median-start stage A and `tx_median_B` had started under bf16; they were stopped and restarted in fp32. Their bf16 logs are kept as `train_*_bf16.log`.
+
+**Mean-start stage A (`tx_obs_col_A[_reg]`; trained in bf16, no preprocessing), evaluated in fp32, 1 pass, vs the off-the-shelf wrapper:**
+
+| | clean | main (10) | het (4) | log-loss / ECE main | Δ main vs wrapper 1-est. | Δ het |
+|---|---|---|---|---|---|---|
+| classification | 0.742 (= wrapper) | **0.661** (wrapper 0.645, oracle 0.667) | 0.660 (0.656) | **0.813 / 0.034** (0.846 / 0.040) | **+1.5 ± 0.3 (25/27)** | +0.3 ± 0.2 (16/27) |
+| regression (CRPS) | 0.125 (= wrapper) | **0.255** (wrapper 0.278, oracle 0.245) | **0.251** (0.262; oracle 0.253) | PIT err 0.023 (0.024), cov90 0.903 | **−0.024 ± 0.003 (27/27)** | **−0.011 ± 0.002 (24/27)** |
+
+- **The frozen-backbone branch beats the off-the-shelf TabICLv2** on noisy data in both tasks, with no clean-data cost and better calibration.
+- It captures about 70% of the Bayes-oracle headroom: classification 73%, regression 70%.
+- Regression het slightly beats the oracle-denoised input.
+- The fp32 median-start runs (with the wrapper preprocessing) and stage B follow.
+
+Comparison script: [compare_tx.py](experiments/obs_noise/compare_tx.py).
+
+**Two fixes found while restarting in fp32.**
+1. **NaN gradients from the preprocessing** with the median start: the losses went non-finite from step 3. Cause: `tabicl_preprocess` differentiated through its own fitted statistics. A context column with a single repeated value (point masses and censoring limits are common in the prior) gives a second-stage sd of sqrt(0), whose gradient is 0·∞ = NaN. The median start made it bite, because it passes gradients into exactly those cells.
+   - **Fix:** the fitted statistics are detached (constants, as in the wrapper, which fits them on the training rows); gradients flow through x only. The forward values are unchanged.
+   - Re-checked: the same seed and data stream give finite gradients and parameters.
+2. **Memory:** in fp32 each 27M job needs 7–9 GiB at micro-batch 4, so two jobs did not fit (`tx_median_B` hit OOM 3×).
+   - Measured peaks at micro-batch 2: stage A obs 3.6 GiB, stage B obs 4.7 GiB (Muon), stage B median 3.8 GiB; K = 50 batches ≤ 4.5 GiB.
+   - All TabICLv2 runs now use micro-batch 2; the effective batch is unchanged at 32 tables.
+   - About 1.3 s/step with two jobs.
+
+**Branch upgrades for the 27M backbone (queued as stage-A screens).** Options in [obs_model.py](obs_model.py); all keep both guarantees, verified with every zero-init map randomized (`python obs_model.py --col_tok`).
+
+| idea | decision | implementation |
+|---|---|---|
+| capacity matched to the backbone | **screen** (`tx_scr_cap_A`) | `d_s` 64 (was 32) + `n_sab` 2 (a second self-attention block over replicates): 124k vs ~30k branch params |
+| richer column token: include single cells, several modes, cross-attention | **screen** (`tx_scr_tok_A`) | `col_tok` 4. Every context cell (replicated or single) is summarized as [median z, log n, log(1 + MAD z), limit-tie share, n == 1] → MLP → pooled per column by 4 learned seed queries (several modes, e.g. a floor cluster plus the bulk). Replicates cross-attend to the 4 tokens; zero-init output. |
+| target-aware column summary | flag ready (`col_tok_target`), screened only if `col_tok` helps | context rows' label embedding added to their cell summaries before pooling (leak-free) |
+| cross-feature, same-replicate attention (whole-well failures) | **deferred** | needs paired replicates in the prior (backlog P2) plus matching eval data; without them there is nothing to learn |
+
+- **Screens:** classification, frozen backbone, median start, fp32, 3000 steps each. Compared with `tx_obs_colmed_A` at the same steps.
+- **Schedule:** lane 2 after `tx_median_B` ([lane2b.sh](experiments/obs_noise/lane2b.sh); configs in `screen_cfgs.json`, read at launch). The regression median-start stage A and `tx_median_B_reg` follow them.
+
+**Global gate failed; per-cell gate (`center: 'attn_medg'`).**
+- With the median start and one global gate α, the gate stayed at ≈ 0: 10α = −0.0075 / −0.0045 at steps 250 / 750. The center therefore stayed the median.
+- `tx_obs_colmed_A` gained only +0.39 / +0.41 points over median at steps 500 / 750: only through the embedding paths, without location learning.
+- **Cause:** one scalar cannot serve all noise families. Cauchy cells want the median (α ≤ 0), censored cells a mean-like or attention center (α > 0), so their gradients cancel.
+- **Fix:** g = `rep_gate`(cell vector), zero-init linear head; center = median + g · (attention center − median), per cell.
+  - Step 0 equals TabICLv2 + median exactly (0.0, TabICLv2 config with the preprocessing).
+  - The gate head gets a gradient immediately (norm 7.7 at step 0). The attention scores learn once g ≠ 0.
+- **Runs:** `tx_obs_colmed_A` stopped at about step 1000 (kept as a record). The stage A, screens and stage B now use `attn_medg` ([lanes_g.sh](experiments/obs_noise/lanes_g.sh)).
+- **`tx_median_B`** (TabICLv2 + median continued with Muon, lr 1.5e-5): +0.17 points over its step-0 reference at step 1000; clean −0.1. A small bar for stage B to clear.
+
+**`tx_median_B` (TabICLv2 + median imputation, backbone continued with Muon, lr 1.5e-5, 4000 steps; fp32 + wrapper preprocessing), 27 datasets, 1 pass:**
+- clean **0.744** (wrapper 0.742);
+- main 0.648, **+0.3 ± 0.1 vs the wrapper (20/27)**;
+- het 0.657; log-loss 0.839; ECE 0.035.
+
+**No forgetting:** continued training with Muon on our noise mixture keeps, and slightly improves, TabICLv2's clean accuracy. The noisy gain from imputation plus continued training alone is small (+0.3). On validation it plateaued at +0.22 from step 2000.
+
+**Per-cell gate `tx_obs_colmedg_A`, validation vs median:** +0.76 / +0.93 / +1.11 / +1.23 at steps 1000 / 1500 / 2000 / 2500, still rising.
+- `fail_floor` +4.2, heavy censoring +1.7, Cauchy / per-row Cauchy +0.6, clean 0.
+
+**Screens and checks (stage A, classification).**
+- **`tx_scr_gate10_A` (10× lr on the gate and location heads): stopped at 1500.** Identical to `tx_obs_colmedg_A` at the same steps (+0.75 / +0.93 / +0.92 vs +0.76 / +0.86 / +0.93). The location learning rate is not the bottleneck.
+- **Mean vs median imputation under fp32 + preprocessing** (TabICLv2, step 0, validation points):
+
+  | heavy censoring | Cauchy | per-row Cauchy | `fail_floor` | Gaussian / plate / detection dropout |
+  |---|---|---|---|---|
+  | −0.6 | −6.1 | −5.2 | −5.3 | +0.5 / +0.8 / +0.5 |
+
+  - The mean-start run's large censoring gains (+5.5) were measured against the bf16 median reference, which bf16 degraded most exactly there.
+  - Under fp32 the median is the stronger start everywhere that matters, and the per-cell gate's +1.8 on heavy censoring is a genuine gain.
+- **`tx_obs_colmedg_A`:** +1.31 / +1.33 / +1.37 at steps 3500 / 3750 / 4000. Still rising slowly as the cosine schedule decays. The branch keeps training in stage B (branch lr 3e-4), so stage A is not extended.
+
+**`tx_obs_colmedg_A` final (per-cell gate, fp32 + preprocessing, 6000 steps), 27 datasets vs the wrapper 1-est.:**
+
+| | clean | main (10) | het (4) | log-loss main |
+|---|---|---|---|---|
+| 1 pass | 0.742 | 0.660, **+1.5 ± 0.3 (25/27)** | 0.661, +0.5 ± 0.2 | 0.815 |
+| 8 passes | 0.741 | 0.661, +1.5 | 0.663, **+0.6 ± 0.2 (17/27)** | 0.813 |
+
+- Same main-setting gain as the bf16-trained mean-start run (+1.5), slightly better on het (+0.5 / +0.6 vs +0.3).
+- The median start mainly buys a clean step-0 readout and safety; ensembling adds nothing for a TabICLv2 backbone.
+- Final validation: +1.45 over median at steps 5500–6000 (flattening as the cosine schedule decays).
+- **Stage B (`tx_obs_B`) from it:** +1.33 points over `tx_median_B` at step 250, clean unchanged (0.8002 vs 0.7999).
+- **Capacity screen `tx_scr_cap_A`:** +1.21 at step 1750, vs about +1.0 for `tx_obs_colmedg_A` at that step.
+
+**Screens, final (stage A, classification; mean noisy validation gain over median, points):**
+
+| step | base (`tx_obs_colmedg_A`, d_s 32) | capacity (`tx_scr_cap_A`, d_s 64 + 2 SAB) | column tokens (`tx_scr_tok_A`, 4 tokens) |
+|---|---|---|---|
+| 1000 | +0.76 | **+0.94** | +0.65 |
+| 1500 | +0.93 | **+1.15** | +0.85 |
+| 3000 | ≈ +1.27 | **+1.40** (3000-step schedule) | stopped at 1500 |
+| 6000 | +1.45 | — | — |
+
+- **Capacity wins.** It reaches in 3000 steps what the base reaches in 6000, mainly on `fail_floor` and censoring.
+- **Pooled column tokens are slower** than the single average (`fail_floor` +2.2 vs +3.1 at step 1500); stopped. `col_tok_target` is therefore not screened.
+- **Regression stage A (`tx_obs_colmedg_A_reg`) uses the capacity config.** The name is kept for the lane-1 dependency; the config is in `reg_cfg.json`, logged at launch.
+- **Full-length capacity stage A for classification (`tx_obs_cap_A`, 6000 steps)** queued after stage B ([lane3.sh](experiments/obs_noise/lane3.sh)).
+- **Stage B `tx_obs_B`:** +1.40 / +1.49 / +1.51 / +1.61 / +1.65 / +1.68 over `tx_median_B` at steps 750 … 2750. Clean equal to `tx_median_B` (0.800).
+
+### Stage B result, classification (`tx_obs_B`: from `tx_obs_colmedg_A`, backbone unfrozen with Muon lr 1.5e-5, branch AdamW 3e-4, 4000 steps, fp32 + preprocessing). 27 datasets.
+
+| | clean | main (10) | grouped | het (4) | log-loss main | ECE main | Δ main vs wrapper 1-est. | Δ het vs wrapper |
+|---|---|---|---|---|---|---|---|---|
+| TabICLv2 wrapper, 1 est. | 0.742 | 0.645 | 0.663 | 0.656 | 0.846 | 0.040 | | |
+| `tx_median_B` (TabICLv2 + median, same continued training) | 0.744 | 0.648 | 0.667 | 0.657 | 0.839 | 0.035 | +0.3 ± 0.1 | +0.1 |
+| `tx_obs_colmedg_A` (stage A) | 0.742 | 0.660 | 0.670 | 0.661 | 0.815 | 0.035 | +1.5 ± 0.3 | +0.5 |
+| **`tx_obs_B`, 1 pass** | 0.742 | **0.664** | 0.674 | **0.664** | **0.805** | 0.035 | **+1.9 ± 0.4 (25/27)** | **+0.8 ± 0.3 (21/27)** |
+| **`tx_obs_B`, 8 passes** | 0.742 | **0.666** | 0.676 | **0.666** | 0.803 | 0.035 | **+2.0 ± 0.4 (25/27)** | **+1.0 ± 0.3 (21/27)** |
+| TabICLv2 + Bayes-oracle input, wrapper | 0.742 | 0.667 | 0.678 | 0.661 | 0.801 | 0.040 | +2.2 | +0.5 |
+
+- **Main settings:** within 0.1–0.3 points of the Bayes-oracle-denoised input (about 90% of the oracle headroom).
+- **Het settings:** above the oracle input (0.666 vs 0.661).
+- **Log-loss:** about equal to the oracle's (0.803 vs 0.801).
+- **No clean cost; better calibration than the wrapper.**
+- **Stage B adds +0.4 / +0.3 (main / het)** over stage A; plain continued training of TabICLv2 + median adds only +0.3 over the wrapper.
+- Validation vs `tx_median_B` at the same step: +1.33 (step 250) → +1.68 (2750), then flat to the end.
+
+**Memory: capacity-sized jobs are serialized.**
+- The capacity branch (d_s 64, 2 SAB) ran out of memory 4× next to the unfrozen stage B, and 3× next to a second capacity stage A.
+- **Activation checkpointing** of the replicate encoder during training (`torch.utils.checkpoint`; identical loss and gradients, max |Δ| = 0.0) removed the 50-replicate attention-map peak, but two capacity jobs still do not fit together.
+- **New order ([lane4.sh](experiments/obs_noise/lane4.sh)):**
+  1. regression stage A (running);
+  2. regression stage B branch + `tx_median_B_reg` in parallel;
+  3. regression evaluation;
+  4. classification capacity stage A (`tx_obs_cap_A`, 6000);
+  5. a second classification stage B from it (`tx_obs_capB`; `phase_txB.sh` now takes `OBS_NAME`);
+  6. its evaluation.
+
+### Regression, TabICLv2 backbone (fp32 + preprocessing), 27 datasets, 1 pass (CRPS, lower is better)
+
+| | clean | main (10) | het (4) | PIT err | cov90 | Δ main vs wrapper | Δ het vs wrapper |
+|---|---|---|---|---|---|---|---|
+| TabICLv2 wrapper, 1 est. | 0.125 | 0.278 | 0.262 | 0.024 | 0.900 | | |
+| `tx_median_B_reg` (median + continued training, Muon) | 0.126 | 0.275 | 0.260 | 0.022 | 0.902 | −0.003 (27/27) | −0.002 |
+| **`tx_obs_colmedg_A_reg`** (stage A: per-cell gate + capacity, frozen) | 0.126 | **0.254** | **0.251** | **0.022** | 0.904 | **−0.025 ± 0.003 (26/27)** | **−0.011 ± 0.002 (25/27)** |
+| TabICLv2 + Bayes-oracle input | 0.125 | 0.245 | 0.253 | 0.024 | 0.906 | −0.033 | −0.009 |
+
+- **Stage A alone:** about 75% of the oracle headroom on the main settings; better than the oracle input on het; better calibrated than the wrapper.
+- Validation: −0.0172 vs median at step 6000, flat over the last 500 steps.
+- **Stage B (`tx_obs_B_reg`), mid-run:** −0.0198 vs `tx_median_B_reg` at step 2250 (−0.0163 at step 500), i.e. about −0.023 vs TabICLv2 + median. Clean validation CRPS steady at 0.1775 (step 0: 0.1771).
+
+**Paired test, stage B vs stage A (classification), 27 datasets.**
+
+| | accuracy Δ (points) | log-loss Δ |
+|---|---|---|
+| main, 1 pass | **+0.41 ± 0.12 (19/27; t p = 0.002, Wilcoxon p = 0.0008)** | **−0.010 ± 0.002 (25/27; p = 0.0003)** |
+| main, 8 passes | +0.51 ± 0.12 (23/27; p = 0.0002) | −0.010 (25/27) |
+| het, 1 pass | +0.33 ± 0.14 (18/27; p = 0.03) | −0.006 (23/27; p < 0.001) |
+| clean, 1 pass | −0.01 (p = 0.9) | +0.002 (p = 0.03; slight clean-calibration cost) |
+
+- **The gain is concentrated in the failure modes:** `fail_shift` +1.9 ± 0.6, `fail_floor` +1.1 ± 0.3.
+- **Heavy tails and censoring are ≈ unchanged:** Cauchy +0.4 ± 0.3, per-row Cauchy −0.1, heavy censoring −0.1. These are the modes LINCS actually shows (real-data check); the other settings are within +0.1 to +0.5.
+- Stage B's validation gain plateaued: +1.68 at step 2750, +1.71 at step 4000. More steps of the same recipe are unlikely to help.
+- Settings are not independent and several comparisons were made. The main / log-loss results survive a Bonferroni correction; het does not.
+
+## Exp 9 — Real replicate data (LINCS) and a real-shaped synthetic prior (2026-10-20, running)
+
+**Training data is synthetic only.**
+- Every run trains and validates on the synthetic bank (`artifacts/bank*`: clean nanoprior tables from `gen_bank.py`), with replicate noise simulated at training time.
+- No real sample enters training. The TabICLv2 weights are the released ones, pretrained by its authors on TabICL's synthetic prior.
+- **Caveat: LINCS is now development data.** The v3 prior below (the `contam` shape, the mixture weights) was designed after looking at LINCS: the replicate noise check and the mean-vs-median result on the dose split. LINCS results for v3-prior runs are therefore not a clean held-out test; earlier runs' priors were fixed before LINCS.
+- **Held-out real test sets:** Tox21 and gas-sensor drift. Their loaders come next. Nothing is tuned on them, and they are only looked at once the prior is frozen.
+
+**Loader ([real_data.py](experiments/obs_noise/real_data.py)), same format as the simulated settings** (`replicates` n × d × K NaN-padded, `counts`, `y`, `train_idx`, `test_idx`):
+- one row per (compound, dose); its replicate wells are the replicates (L1000 ≈ 3, Cell Painting ≈ 4.9);
+- features: z-score + PCA to 16 components, both fitted on the DMSO negative-control wells only;
+- 10-way MoA tasks: MoAs ranked by number of compounds, 5 tasks per dataset;
+- single-MoA compounds only; positive-control groups (> 10 wells) excluded.
+- **Two splits:**
+  - `compound`: the paper's split, test compounds unseen;
+  - `dose`: compounds in the context, a seeded third of each compound's dose rows held out; a row's wells stay together.
+- Evaluation: [real_eval.py](experiments/obs_noise/real_eval.py) (our checkpoints), [real_tabicl.py](experiments/obs_noise/real_tabicl.py) (the off-the-shelf wrapper), [real_summary.py](experiments/obs_noise/real_summary.py).
+
+**Compound split: near chance for every model.** Accuracy 0.18–0.20 (chance 0.10); log-loss 2.9–3.0 for the TabICLv2 models, worse than uniform (2.30). Replicate handling cannot matter there: our branch ±1 point, slightly worse log-loss.
+
+**Dose split (10 tasks), all wells:**
+
+| model | acc, 1 / 2 / 3 / all wells | log-loss | vs wrapper + mean, 8 est. |
+|---|---|---|---|
+| wrapper + **mean**, 8 est. | 0.551 / 0.593 / 0.641 / **0.657** | **1.006** | |
+| TabICLv2 + mean, our pipeline | 0.548 / 0.593 / 0.633 / 0.654 | 1.026 | −0.2 ± 0.5 |
+| wrapper + median | 0.546 / 0.592 / 0.551 / 0.577 | 1.218 | −8.0 ± 1.1 |
+| stage A, mean start (v2 prior) | … / 0.631 | 1.089 | −2.5 ± 0.5 |
+| stage A, per-cell median start (v2 prior) | … / 0.624 | 1.121 | −3.2 ± 0.7 |
+| **stage B** (v2 prior) | 0.549 / 0.595 / 0.618 / **0.640** | 1.068 | **−1.6 ± 1.0**; vs median **+6.4 ± 1.1 (10/10)** |
+| best 1M models | … / 0.36–0.37 | 1.79 | −29 |
+
+- **On real LINCS replicates the mean beats the median by 8 points.** The noise is near-Gaussian with rare outliers and only 3–5 wells, so the mean is efficient. The median of 3 wells is even worse than that of 2 (which is their mean).
+- **The branch recovers most of the median's loss** (+6.4 over median, 10/10) and improves monotonically with wells, but **trails plain mean imputation by 1.6 points.** The v2 prior (heavy tails and failures dominate) taught robustness the real data does not need.
+- The TabICLv2 backbone is essential: the 1M models are about 30 points lower.
+
+**v3 prior (dev-informed, synthetic).**
+- New mode `contam`: Gaussian, plus per table p_out ~ U(0, 0.08) of the replicates replaced by outliers logU(3, 30)× wider. Tails: P(|e| > 3 / 8 robust sd) = 3.6% / 1.8%, vs LINCS 5.0–6.8% / 1.1–1.7%.
+- Sampling weights: contam 6, Gaussian 3, Student-t₃ / plate / constant-CV 2, all other modes 1 (≈ 58% near-Gaussian; robustness to the rest kept).
+- Earlier noise streams are unchanged.
+- **Run `tx_obs_real_A`:** stage A, capacity config, per-cell median start, 6000 steps. Then a stage B from it (`tx_obs_realB`). Both evaluated on the LINCS splits and the 27 synthetic datasets ([lane5.sh](experiments/obs_noise/lane5.sh)).

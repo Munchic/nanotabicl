@@ -4,8 +4,8 @@ same 4 validation blocks and settings. Classification: accuracy / log-loss (Δ >
 import json, os, sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-RUNS = sys.argv[1:] or ['tx_obs_col_A', 'tx_obs_col_A_reg', 'tx_obs_colmed_A', 'tx_obs_colmed_A_reg', 'tx_obs_B',
-                        'tx_median_B', 'tx_obs_B_reg', 'tx_median_B_reg']
+RUNS = sys.argv[1:] or ['tx_obs_real_A', 'tx_obs_realB', 'tx_obs_cap_A', 'tx_obs_colmedg_A', 'tx_scr_gate10_A', 'tx_scr_cap_A', 'tx_scr_tok_A', 'tx_obs_colmedg_A_reg', 'tx_obs_B', 'tx_median_B',
+                        'tx_obs_B_reg', 'tx_median_B_reg']
 
 
 def logv(name):
@@ -15,7 +15,10 @@ def logv(name):
 
 for run in RUNS:
     reg = run.endswith('_reg')
-    ref = logv('tx_median0' + ('_reg' if reg else ''))[-1]['val']
+    # reference: TabICLv2 + median at step 0 with the same precision / preprocessing as the run (fp32 + wrapper
+    # preprocessing for runs started after the port: tx_median0p; the bf16 mean-start stage A: tx_median0)
+    ref = logv(('tx_median0' if run.startswith('tx_obs_col_A') else 'tx_median0p_v3' if 'real' in run else 'tx_median0p')
+               + ('_reg' if reg else ''))[-1]['val']
     if run.startswith('tx_obs_B'):  # stage B: vs the matched continued baseline at the same step (and clean vs step 0)
         B = {r['step']: r['val'] for r in logv(run.replace('tx_obs_B', 'tx_median_B')) if 'val' in r}
         for r in [r for r in logv(run) if 'val' in r and r['step'] in B][-3:]:

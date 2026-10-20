@@ -23,6 +23,7 @@ DATA, EXT, EXT2, EXT3, BAYES, BAYES2, BAYES3, PROBS = (art(p) for p in ('data', 
                                                                          'bayes_ext2', 'bayes_ext3', 'probs'))
 SRC_DIR = {'main': DATA, 'ext': EXT, 'ext2': EXT2, 'ext3': EXT3}
 ENS_SEED = 4242
+FP32 = False
 
 
 # Exp 6 core suite: redundant settings dropped (t3, two-sided censoring, value-dependent gauss/cauchy and plain left
@@ -90,7 +91,7 @@ def ens_predict(model, inp, y_in, mode, task, k, n_ens):
         perm = np.arange(n_cols) if i == 0 else np.random.default_rng([ENS_SEED, i]).permutation(n_cols)
         shift = 0 if task == 'regression' else i % k
         x = permute_cols(inp, torch.tensor(perm, device=inp[0].device), mode)
-        with torch.autocast('cuda', dtype=torch.bfloat16):
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=not FP32):
             logits = model(*x, y_in if shift == 0 else (y_in + shift) % k)
         if task == 'regression':  # a 999-quantile head (TabICLv2, levels k / 1000) -> our 99 levels k / 100
             q = np.sort(logits[0].float().cpu().numpy(), 1)
@@ -108,6 +109,9 @@ def evaluate(ckpt_path, out_path, tag, sources, variant=None, n_ens=1):
     mode = ck['mode']
     task = ck.get('task', 'classification')
     model = make_model(mode, ck['rep_cfg'], task, cfg=ck.get('model_cfg')).to(dev).eval()
+    global FP32  # TabICLv2-arch checkpoints: fp32 + TF32 (bf16 costs the released TabICLv2 2-4 points); nano: bf16
+    FP32 = ck.get('arch') == 'tabicl'
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = FP32
     model.load_state_dict(ck['state_dict'])
     manifest = json.load(open(os.path.join(DATA, 'manifest.json')))
     probs_dir = os.path.join(PROBS, tag)

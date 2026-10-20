@@ -21,6 +21,19 @@ K = 10
 NOISES = ['gauss', 'student_t3', 'censored', 'cauchy', 'cauchy_hetero',
           'gauss_valhet', 'cauchy_valhet', 'censored_left', 'censored_left_heavy']  # same models as gen_data.py
 NOISES_V2 = NOISES + ['fail_floor', 'fail_shift', 'cv_lognormal', 'lod_logistic', 'saturation', 'plate_effect']  # Exp 6
+# v3 (Exp 8, after the LINCS check): + 'contam', a contaminated Gaussian (per table p_out ~ U(0, 0.08) of the replicates
+# replaced by Gaussian outliers logU(3, 30) x wider), the shape real LINCS replicate noise has (t2-like tails from
+# 2-3% outliers, otherwise ~Gaussian); with --noise_weights the mixture can be tilted toward it
+NOISES_V3 = NOISES_V2 + ['contam']
+CONTAM_ID = NOISES_V3.index('contam')
+NOISE_W = None  # --noise_weights: sampling weights over TRAIN_NOISES (None = uniform, the original stream)
+
+
+def sample_ids(shape, g, dev):
+    if NOISE_W is None:
+        return torch.randint(len(TRAIN_NOISES), shape, device=dev, generator=g)
+    w = NOISE_W.to(dev)
+    return torch.multinomial(w, math.prod(shape), replacement=True, generator=g).view(shape)
 TRAIN_NOISES = NOISES  # set by --noise_set; v1 keeps the original training mixture and RNG stream
 N_VAL = 16
 VAL_CHUNK = 8
@@ -45,11 +58,11 @@ def noise_layout(layout, B, R, C, n_groups, g, dev):
     logu = lambda *shape: torch.exp(torch.empty(*shape, device=dev).uniform_(math.log(0.1), 0.0, generator=g))
     precise = gid = cap = None
     if layout == 'col':
-        ids, sc = torch.randint(n_id, (B, 1, C, 1), device=dev, generator=g), logu(B, 1, C, 1)
+        ids, sc = sample_ids((B, 1, C, 1), g, dev), logu(B, 1, C, 1)
     else:
         gid = torch.randint(n_groups, (B, R), device=dev, generator=g)
         shape = (B, n_groups, 1) if layout == 'group' else (B, n_groups, C)
-        ids_g, sc_g = torch.randint(n_id, shape, device=dev, generator=g), logu(*shape)
+        ids_g, sc_g = sample_ids(shape, g, dev), logu(*shape)
         idx = gid[..., None].expand(B, R, shape[-1])
         ids, sc = ids_g.gather(1, idx)[..., None], sc_g.gather(1, idx)[..., None]
         k_cap = torch.where(torch.rand(B, n_groups, device=dev, generator=g) < 0.5,
@@ -72,8 +85,8 @@ def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None
     col_sd = X.std(dim=1, keepdim=True).clamp(min=1e-12)[..., None]  # (B, 1, C, 1)
     if scale is None:
         scale = torch.exp(torch.empty(B, 1, 1, 1, device=dev).uniform_(math.log(0.1), 0.0, generator=g))
-    noise_ids = (torch.full((B,), NOISES_V2.index(noise), device=dev) if noise is not None
-                 else torch.randint(len(TRAIN_NOISES), (B,), device=dev, generator=g))
+    noise_ids = (torch.full((B,), NOISES_V3.index(noise), device=dev) if noise is not None
+                 else sample_ids((B,), g, dev))
     nid = noise_ids[:, None, None, None]
     precise = cap = None
     if layout not in (None, 'table'):
@@ -95,6 +108,11 @@ def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None
     cauchy = torch.tan(math.pi * (torch.rand(B, R, C, K, device=dev, generator=g) - 0.5))
     eps = torch.where(nid == 1, t3, torch.where((nid == 3) | (nid == 4) | (nid == 6), cauchy,
                                                 torch.where(nid == 8, t2, gauss)))
+    if (nid == CONTAM_ID).any():  # contaminated Gaussian (extra draws only when present: earlier streams unchanged)
+        p_out = 0.08 * torch.rand(B, 1, 1, 1, device=dev, generator=g)
+        out = torch.rand(B, R, C, K, device=dev, generator=g) < p_out
+        wide = torch.exp(torch.empty(B, R, C, K, device=dev).uniform_(math.log(3), math.log(30), generator=g))
+        eps = torch.where((nid == CONTAM_ID) & out, gauss * wide, eps)
     row_scale = torch.where(nid == 4, torch.exp(torch.randn(B, R, 1, 1, device=dev, generator=g)), 1.0)
     # value-dependent heteroscedasticity (valhet): scale = 2 * percentile rank of the clean value in its column
     u = (X.argsort(dim=1, stable=True).argsort(dim=1, stable=True) + 1).to(X.dtype) / R
@@ -220,6 +238,14 @@ def make_model(mode, rep_cfg, task='classification', cfg=None):
     return ObsNanoTabICL(**cfg, **rep_cfg) if mode == 'obs' else NanoTabICLv2(**cfg)
 
 
+LOC_PARAMS = ('rep_gate', 'rep_enc.loc_head', 'rep_alpha')
+PRECISION = 'bf16'  # 'bf16' autocast (the ~1M nano runs) or 'fp32' with TF32 matmuls (TabICLv2: its training default)
+
+
+def amp():
+    return torch.autocast('cuda', dtype=torch.bfloat16, enabled=PRECISION == 'bf16')
+
+
 def set_quantiles(nq):  # regression head size: 99 (nano) or 999 (TabICLv2); levels k / (nq + 1)
     global NQ, TAUS
     NQ, TAUS = nq, torch.arange(1, nq + 1) / (nq + 1)
@@ -314,7 +340,7 @@ def validate(model, mode, bank, dev):
                 n_train = 512
                 if TASK == 'regression':
                     y = standardize_y(y, n_train)
-                with torch.autocast('cuda', dtype=torch.bfloat16):
+                with amp():
                     if noise is None and mode != 'clean':
                         reps = X[..., None].expand(*X.shape, K)
                         mask = (torch.arange(K, device=dev) < 1).expand(*X.shape, K)
@@ -370,7 +396,9 @@ def main():
     ap.add_argument('--task', choices=['classification', 'regression'], default='classification')
     ap.add_argument('--regimes', default='', help='json weights over REGIMES (cell,row,col,ctxq); empty = per-cell only')
     ap.add_argument('--k50_prob', type=float, default=0.0, help='share of batches with up to 50 replicates per cell')
-    ap.add_argument('--noise_set', choices=['v1', 'v2'], default='v1', help='v2 adds the Exp 6 failure / literature modes')
+    ap.add_argument('--noise_set', choices=['v1', 'v2', 'v3'], default='v1',
+                    help='v2 adds the Exp 6 failure / literature modes; v3 adds the contaminated Gaussian (contam)')
+    ap.add_argument('--noise_weights', default='', help='json {noise: weight} over the noise set (others weight 1)')
     ap.add_argument('--y_clip', type=float, default=0.0, help='regression: soft-clip standardized targets to +-y_clip in training')
     ap.add_argument('--layouts', default='', help='json weights over LAYOUTS (table,col,group,colgroup), drawn per batch; '
                                                   'empty = one model per table (original stream)')
@@ -383,15 +411,24 @@ def main():
     ap.add_argument('--log_every', type=int, default=0, help='also log the running train loss every N steps')
     ap.add_argument('--optim', choices=['adamw', 'muon'], default='adamw', help='muon: backbone with TabICLv2\'s Muon')
     ap.add_argument('--muon_wd', type=float, default=0.0, help='Muon weight decay (tabicl.train default 0)')
+    ap.add_argument('--gate_lr_mult', type=float, default=1.0, help='lr multiplier for the location parameters (per-cell '
+                    'gate rep_gate, location scores rep_enc.loc_head): both start at zero and gate each other\'s gradient')
+    ap.add_argument('--precision', choices=['bf16', 'fp32'], default=None,
+                    help='default: fp32 (+TF32 matmuls) for --arch tabicl, bf16 autocast for nano. bf16 costs the released '
+                         'TabICLv2 2-4 accuracy points (e.g. clean 0.742 -> 0.720)')
     args = ap.parse_args()
     dev = 'cuda'
-    global TASK, TRAIN_NOISES, ARCH, VAL_BLOCKS, VAL_NOISES
+    global TASK, TRAIN_NOISES, ARCH, VAL_BLOCKS, VAL_NOISES, PRECISION
     TASK, ARCH = args.task, args.arch
+    PRECISION = args.precision or ('fp32' if ARCH == 'tabicl' else 'bf16')
+    if PRECISION == 'fp32':  # TF32 tensor-core matmuls, as tabicl.train sets (10-bit mantissa vs bf16's 7)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     VAL_BLOCKS = min(args.val_blocks, N_VAL)
     VAL_NOISES = args.val_noises.split(',') if args.val_noises else None
     if ARCH == 'tabicl' and TASK == 'regression':
         set_quantiles(load_tabicl('regression')[0]['out_dim'])
-    TRAIN_NOISES = NOISES_V2 if args.noise_set == 'v2' else NOISES
+    TRAIN_NOISES = {'v1': NOISES, 'v2': NOISES_V2, 'v3': NOISES_V3}[args.noise_set]
     regimes = json.loads(args.regimes) if args.regimes else None
     layouts = (lambda w: np.asarray(w) / np.sum(w))(json.loads(args.layouts)) if args.layouts else None
     use_aux = args.aux_w > 0
@@ -407,6 +444,15 @@ def main():
     json.dump(vars(args), open(os.path.join(out_dir, 'args.json'), 'w'), indent=1)
 
     rep_cfg = json.loads(args.rep_cfg)
+    for k, v in rep_cfg.pop('_args', {}).items():  # training-argument overrides carried in the branch config (screens)
+        assert hasattr(args, k), k
+        setattr(args, k, v)
+    global NOISE_W
+    TRAIN_NOISES = {'v1': NOISES, 'v2': NOISES_V2, 'v3': NOISES_V3}[args.noise_set]  # (after the overrides)
+    if args.noise_weights:
+        w = json.loads(args.noise_weights) if isinstance(args.noise_weights, str) else args.noise_weights
+        assert set(w) <= set(TRAIN_NOISES), w
+        NOISE_W = torch.tensor([float(w.get(nm, 1.0)) for nm in TRAIN_NOISES])
     model = make_model(args.mode, rep_cfg, args.task).to(dev)
     if args.init or ARCH == 'tabicl':
         sd = torch.load(args.init, map_location=dev)['state_dict'] if args.init else load_tabicl(TASK)[1]
@@ -421,12 +467,20 @@ def main():
     groups = [g for g in [dict(params=rest, lr=args.lr), dict(params=rep, lr=args.lr * args.rep_lr_mult)] if g['params']]
     if args.rep_lr_mult == 1.0:  # single group == the original optimizer layout (keeps old checkpoints resumable)
         groups = params
+    loc = [p for n, p in model.named_parameters() if n.startswith(LOC_PARAMS)]
+    if args.gate_lr_mult != 1.0 and loc:  # location learning (per-cell gate + attention scores) at its own lr
+        ids = {id(p) for p in loc}
+        rep = [p for p in rep if id(p) not in ids]
+        groups = [g for g in [dict(params=rest, lr=args.lr), dict(params=rep, lr=args.lr * args.rep_lr_mult),
+                              dict(params=loc, lr=args.lr * args.rep_lr_mult * args.gate_lr_mult)] if g['params']]
     if args.optim == 'muon':  # TabICLv2's own optimizer for the backbone (tabicl.train: one Muon group for all its
         # parameters, matched_adamw_rms 0.2, Nesterov, momentum beta1, wd 0); the replicate branch stays on AdamW
         # (Muon's internal AdamW, our betas / wd), as in stage A
         from muon import Muon
         groups = [g for g in [dict(params=rest, lr=args.lr, use_muon=True, weight_decay=args.muon_wd),
-                              dict(params=rep, lr=args.lr * args.rep_lr_mult, use_muon=False, weight_decay=0.01)]
+                              dict(params=rep, lr=args.lr * args.rep_lr_mult, use_muon=False, weight_decay=0.01)] +
+                  ([dict(params=loc, lr=args.lr * args.rep_lr_mult * args.gate_lr_mult, use_muon=False, weight_decay=0.01)]
+                   if args.gate_lr_mult != 1.0 and loc else [])
                   if g['params']]
         opt = Muon(groups, lr=args.lr, weight_decay=args.muon_wd, matched_adamw_rms=0.2, momentum=0.9, nesterov=True,
                    ns_steps=5, adamw_betas=(0.9, 0.95), adamw_eps=1e-8)
@@ -484,7 +538,7 @@ def main():
             mb = max(1, mb // 4)
         loss_sum, ok = 0.0, True
         for i in range(0, args.batch_size, mb):  # gradient accumulation; loss = mean over all valid test cells
-            with torch.autocast('cuda', dtype=torch.bfloat16):
+            with amp():
                 logits = model_forward(model, args.mode, X[i:i + mb], y[i:i + mb, :n_train], g, aux=use_aux, **obs_kw)
             if use_aux:
                 logits, l_aux = logits

@@ -30,7 +30,8 @@ def nano_config(tc):  # TabICL config -> NanoTabICLv2 kwargs
                 embed_dim=tc['embed_dim'], col_num_blocks=tc['col_num_blocks'], row_num_blocks=tc['row_num_blocks'],
                 icl_num_blocks=tc['icl_num_blocks'], col_nhead=tc['col_nhead'], row_nhead=tc['row_nhead'],
                 icl_nhead=tc['icl_nhead'], feature_group_size=tc['col_feature_group_size'], n_cls_cols=tc['row_num_cls'],
-                n_cls_rows=tc['col_num_inds'], group_shift=0)  # TabICL groups feature i with i + 1, i + 2, i + 4
+                n_cls_rows=tc['col_num_inds'], group_shift=0,  # TabICL groups feature i with i + 1, i + 2, i + 4
+                preproc='tabicl')  # the sklearn wrapper's input preprocessing (model.tabicl_preprocess)
 
 
 def convert(sd):

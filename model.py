@@ -5,11 +5,15 @@ class NanoTabICLv2(nn.Module):
     def __init__(self, max_classes: int, out_dim: int, embed_dim: int = 128,
                  col_num_blocks: int = 3, row_num_blocks: int = 3, icl_num_blocks: int = 12,
                  col_nhead: int = 8, row_nhead: int = 8, icl_nhead: int = 8,
-                 feature_group_size: int = 3, n_cls_cols: int = 4, n_cls_rows: int = 128, group_shift: int = 1):
+                 feature_group_size: int = 3, n_cls_cols: int = 4, n_cls_rows: int = 128, group_shift: int = 1,
+                 preproc: str = 'standard'):
         # classification: max_classes = out_dim (= 10 typically); regression: max_classes = 0, out_dim = n_quantiles
         super().__init__()
         self.feature_group_size = feature_group_size
         self.group_shift = group_shift  # feature i is grouped with features i + 2^k - group_shift (TabICLv2: 0)
+        # input preprocessing, fitted on the training rows: 'standard' (z-score) or 'tabicl' (the TabICLv2 sklearn
+        # wrapper's 'none' pipeline: z-score clipped to +-100, then two-stage 4-sd outlier soft clipping)
+        self.preproc = preproc
         icl_dim = embed_dim * n_cls_cols
 
         self.x_embed = nn.Linear(feature_group_size, embed_dim)
@@ -35,7 +39,10 @@ class NanoTabICLv2(nn.Module):
         n_batch, n_train = y.shape
 
         # ----- Embedding: standardize -> repeated feature grouping -> x embedding -> add y embedding to train
-        x = (x - x[:, :n_train].mean(dim=1, keepdim=True)) / (x[:, :n_train].std(dim=1, unbiased=False, keepdim=True) + 1e-8)
+        if self.preproc == 'tabicl':
+            x = tabicl_preprocess(x, n_train)
+        else:
+            x = (x - x[:, :n_train].mean(dim=1, keepdim=True)) / (x[:, :n_train].std(dim=1, unbiased=False, keepdim=True) + 1e-8)
         idxs = torch.arange(n_cols, dtype=torch.long, device=x.device)
         x = torch.stack([x[:, :, (idxs + (2 ** i - self.group_shift)) % n_cols] for i in range(self.feature_group_size)], dim=-1)
         emb = self.x_embed(x)  # emb.shape = (n_batch, n_rows, n_cols, embed_dim)
@@ -64,6 +71,29 @@ class NanoTabICLv2(nn.Module):
         emb = self.icl_blocks[-1](emb[:, n_train:], emb[:, :n_train])  # need only test predictions
 
         return self.out_mlp(self.out_ln(emb))  # output MLP
+
+
+def tabicl_preprocess(x: torch.Tensor, n_train: int, threshold: float = 4.0) -> torch.Tensor:
+    """Torch port of tabicl's PreprocessingPipeline(normalization_method='none') (tabicl 2.2.0, _sklearn/preprocessing.py),
+    per table and column, fitted on the first n_train rows: CustomStandardScaler (population sd + 1e-6, clip +-100),
+    then OutlierRemover (bounds mean +- threshold * sd with ddof=1; refit mean / sd without the outliers; soft clip
+    x = max(L - log1p|x|, x), x = min(U + log1p|x|, x)). Not ported: UniqueFeatureFilter (columns constant in the
+    training rows are dropped by tabicl; here they become all-zero columns)."""
+    # the fitted statistics are constants (as in tabicl, which fits on the training rows): gradients flow through x only.
+    # Differentiating through them is also numerically unsafe: a constant training column gives sd = sqrt(0) -> NaN.
+    tr = x[:, :n_train].detach()
+    x = ((x - tr.mean(dim=1, keepdim=True)) / (tr.std(dim=1, unbiased=False, keepdim=True) + 1e-6)).clamp(-100, 100)
+    tr = x[:, :n_train].detach()
+    ddof = 1 if n_train > 1 else 0
+    sd = tr.std(dim=1, correction=ddof, keepdim=True).clamp(min=1e-6)
+    mu = tr.mean(dim=1, keepdim=True)
+    ok = ((tr >= mu - threshold * sd) & (tr <= mu + threshold * sd)).to(x.dtype)
+    cnt = ok.sum(dim=1, keepdim=True)
+    mu = (tr * ok).sum(dim=1, keepdim=True) / cnt.clamp(min=1)
+    sd = torch.sqrt((((tr - mu) ** 2) * ok).sum(dim=1, keepdim=True) / (cnt - ddof).clamp(min=1)).clamp(min=1e-6)
+    lo, hi = mu - threshold * sd, mu + threshold * sd
+    x = torch.maximum(-torch.log1p(x.abs()) + lo, x)
+    return torch.minimum(torch.log1p(x.abs()) + hi, x)
 
 
 class ClassEmbedding(nn.Linear):
