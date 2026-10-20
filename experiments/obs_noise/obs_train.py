@@ -14,7 +14,7 @@ import numpy as np, torch, torch.nn.functional as F
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, '..', '..'))
 from model import NanoTabICLv2  # noqa: E402
-from obs_model import ObsNanoTabICL  # noqa: E402
+from obs_model import ObsNanoTabICL, huber_location  # noqa: E402
 from tabicl_port import load_tabicl  # noqa: E402
 
 K = 10
@@ -26,6 +26,8 @@ NOISES_V2 = NOISES + ['fail_floor', 'fail_shift', 'cv_lognormal', 'lod_logistic'
 # 2-3% outliers, otherwise ~Gaussian); with --noise_weights the mixture can be tilted toward it
 NOISES_V3 = NOISES_V2 + ['contam']
 CONTAM_ID = NOISES_V3.index('contam')
+SCALE_MAX = 1.0  # --scale_max: noise scale ~ logU(0.1, SCALE_MAX) x column sd (1.0 = the original prior)
+SMALL_K_PROB = 0.0  # --small_k_prob: share of tables whose cells get U{2..5} replicates (0 = the original stream)
 NOISE_W = None  # --noise_weights: sampling weights over TRAIN_NOISES (None = uniform, the original stream)
 
 
@@ -55,7 +57,7 @@ def noise_layout(layout, B, R, C, n_groups, g, dev):
     colgroup: own model + scale per (group, column). Group layouts: each group's replicate count is capped at
     U{1..K} w.p. 0.5 (e.g. one lab runs singles, another triplicates)."""
     n_id = len(TRAIN_NOISES)
-    logu = lambda *shape: torch.exp(torch.empty(*shape, device=dev).uniform_(math.log(0.1), 0.0, generator=g))
+    logu = lambda *shape: torch.exp(torch.empty(*shape, device=dev).uniform_(math.log(0.1), math.log(SCALE_MAX), generator=g))
     precise = gid = cap = None
     if layout == 'col':
         ids, sc = sample_ids((B, 1, C, 1), g, dev), logu(B, 1, C, 1)
@@ -84,7 +86,7 @@ def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None
     K = k_max or globals()['K']  # tensor width = max replicates per cell in this batch
     col_sd = X.std(dim=1, keepdim=True).clamp(min=1e-12)[..., None]  # (B, 1, C, 1)
     if scale is None:
-        scale = torch.exp(torch.empty(B, 1, 1, 1, device=dev).uniform_(math.log(0.1), 0.0, generator=g))
+        scale = torch.exp(torch.empty(B, 1, 1, 1, device=dev).uniform_(math.log(0.1), math.log(SCALE_MAX), generator=g))
     noise_ids = (torch.full((B,), NOISES_V3.index(noise), device=dev) if noise is not None
                  else sample_ids((B,), g, dev))
     nid = noise_ids[:, None, None, None]
@@ -140,6 +142,9 @@ def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None
     if (nid >= len(NOISES)).any():  # Exp 6 modes (only drawn with --noise_set v2 or when evaluating them)
         reps = observe_v2(X, reps, nid, col_sd, scale, eps, g)
     counts = torch.randint(1, K + 1, (B, R, C, 1), device=dev, generator=g)
+    if SMALL_K_PROB > 0:  # v4: a share of tables with few replicates per cell, U{2..5} (as in real assays, 3-5 wells)
+        small = torch.rand(B, 1, 1, 1, device=dev, generator=g) < SMALL_K_PROB
+        counts = torch.where(small, torch.randint(2, 6, (B, R, C, 1), device=dev, generator=g), counts)
     if regimes is not None:  # per-table count regime (Exp 5); None keeps the original per-cell draw (and RNG stream)
         counts = count_regimes(counts, regimes, n_train, K, g)
     clean = (torch.rand(B, device=dev, generator=g) < p_clean)[:, None, None, None]
@@ -279,6 +284,8 @@ def model_forward(model, mode, X, y_train, g, aux=False, **obs_kw):
         return model(torch.where(mask, reps, 0).sum(-1) / mask.sum(-1), y_train)
     if mode == 'median':  # median imputation (numpy-equivalent median)
         return model(masked_quantile(reps, mask, 0.5), y_train)
+    if mode == 'huber':  # Huber imputation, column-pooled scale from the context rows
+        return model(huber_location(reps, mask, y_train.shape[1]), y_train)
     if mode == 'stats':
         return model(summary_stats(reps, mask), y_train)
     out = model(reps, mask, y_train)
@@ -344,7 +351,7 @@ def validate(model, mode, bank, dev):
                     if noise is None and mode != 'clean':
                         reps = X[..., None].expand(*X.shape, K)
                         mask = (torch.arange(K, device=dev) < 1).expand(*X.shape, K)
-                        if mode in ('mean', 'median'):
+                        if mode in ('mean', 'median', 'huber'):
                             logits = model(X, y[:, :n_train])
                         elif mode == 'stats':
                             logits = model(summary_stats(reps, mask), y[:, :n_train])
@@ -374,7 +381,7 @@ def validate(model, mode, bank, dev):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode', choices=['clean', 'mean', 'median', 'stats', 'obs'], required=True)
+    ap.add_argument('--mode', choices=['clean', 'mean', 'median', 'huber', 'stats', 'obs'], required=True)
     ap.add_argument('--name', required=True)
     ap.add_argument('--init', default=None, help='checkpoint to start from (strict=False for obs)')
     ap.add_argument('--steps', type=int, default=10000)
@@ -399,6 +406,8 @@ def main():
     ap.add_argument('--noise_set', choices=['v1', 'v2', 'v3'], default='v1',
                     help='v2 adds the Exp 6 failure / literature modes; v3 adds the contaminated Gaussian (contam)')
     ap.add_argument('--noise_weights', default='', help='json {noise: weight} over the noise set (others weight 1)')
+    ap.add_argument('--scale_max', type=float, default=1.0, help='noise scale ~ logU(0.1, scale_max) x column sd')
+    ap.add_argument('--small_k_prob', type=float, default=0.0, help='share of tables with U{2..5} replicates per cell')
     ap.add_argument('--y_clip', type=float, default=0.0, help='regression: soft-clip standardized targets to +-y_clip in training')
     ap.add_argument('--layouts', default='', help='json weights over LAYOUTS (table,col,group,colgroup), drawn per batch; '
                                                   'empty = one model per table (original stream)')
@@ -447,7 +456,8 @@ def main():
     for k, v in rep_cfg.pop('_args', {}).items():  # training-argument overrides carried in the branch config (screens)
         assert hasattr(args, k), k
         setattr(args, k, v)
-    global NOISE_W
+    global NOISE_W, SCALE_MAX, SMALL_K_PROB
+    SCALE_MAX, SMALL_K_PROB = args.scale_max, args.small_k_prob
     TRAIN_NOISES = {'v1': NOISES, 'v2': NOISES_V2, 'v3': NOISES_V3}[args.noise_set]  # (after the overrides)
     if args.noise_weights:
         w = json.loads(args.noise_weights) if isinstance(args.noise_weights, str) else args.noise_weights

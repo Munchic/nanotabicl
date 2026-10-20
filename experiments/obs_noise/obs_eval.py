@@ -59,12 +59,19 @@ def save_probs(path, new):  # merge into an existing per-dataset file (other sou
     np.savez_compressed(path, **old)
 
 
-def inputs(z, s, mode, variant, zb, dev, X_main):
+def inputs(z, s, mode, variant, zb, dev, X_main, tr=None):
     X = z[f'{s}__X_clean'] if f'{s}__X_clean' in z.files else X_main
     t = lambda a: torch.tensor(a, dtype=torch.float32, device=dev)[None]
     if variant == 'bayes':
         assert mode in ('clean', 'mean'), 'bayes-denoised input is for single-value models'
         return (t(X if s in ('clean', 'grouped_clean') else zb[f'{s}__bayes']),)
+    if mode == 'huber':  # Huber imputation of the stored replicates (column scale from the context rows)
+        from huber import huber_impute
+        if s in ('clean', 'grouped_clean'):
+            return (t(X),)
+        R, C = z[f'{s}__replicates'], z[f'{s}__counts'].astype(np.int64)
+        M = np.arange(R.shape[-1])[None, None] < C[..., None]
+        return (t(huber_impute(np.where(M, R, np.nan), M, tr)),)
     if mode in ('clean', 'mean', 'median'):
         return (t(X if s == 'clean' else z[f'{s}__{"median" if mode == "median" else "mean"}']),)
     if mode == 'stats':
@@ -132,7 +139,7 @@ def evaluate(ckpt_path, out_path, tag, sources, variant=None, n_ens=1):
         saved = dict(y_test=y[te])
         for src in sources:
             for s in settings_for(src):
-                inp = [a[:, order] for a in inputs(zs[src], s, mode, variant, zb, dev, zs['main']['X_clean'])]
+                inp = [a[:, order] for a in inputs(zs[src], s, mode, variant, zb, dev, zs['main']['X_clean'], tr)]
                 pred = ens_predict(model, inp, y_in, mode, task, k, n_ens)
                 base = dict(model=tag, ckpt=os.path.relpath(ckpt_path, ROOT), step=ck['step'], mode=mode, task=task,
                             input=variant or 'default', source=src, dataset=e['name'], noise=s, n_ens=n_ens)

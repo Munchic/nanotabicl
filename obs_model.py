@@ -125,6 +125,40 @@ def linear_median(v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (v_lo + (pos - lo) * (v_hi - v_lo)).squeeze(-1)
 
 
+# 1 / median(|r - cell median|) for standard-normal cells of size n = 2..50 (experiments/obs_noise/huber.py)
+HUBER_SCALE_FACTOR = [float('nan'), float('nan')] + [2.0807, 3.1831, 2.0578, 2.0429, 1.9019, 1.8123, 1.7781, 1.7174, 1.7026, 1.6642, 1.6575, 1.6337, 1.6269, 1.6064, 1.6036, 1.593, 1.5868, 1.5759, 1.5772, 1.5673, 1.5686, 1.5619, 1.5572, 1.5536, 1.5514, 1.5462, 1.5455, 1.5417, 1.5426, 1.5402, 1.5382, 1.5332, 1.5337, 1.5306, 1.5298, 1.5262, 1.5299, 1.526, 1.5271, 1.5235, 1.5233, 1.5213, 1.5217, 1.5187, 1.5197, 1.5191, 1.5168, 1.5158, 1.5154]
+HUBER_C = 1.345  # 95% Gaussian efficiency
+
+
+@torch.no_grad()
+def huber_location(reps: torch.Tensor, mask: torch.Tensor, n_train: int, iters: int = 10) -> torch.Tensor:
+    """(B, R, C, K) replicates + mask -> (B, R, C) Huber M-estimate per cell, scale pooled per column over the replicated
+    CONTEXT cells (median of |replicate - cell median| x the Gaussian small-n factor of the cell size). About the mean
+    under Gaussian noise (95% efficiency), about the median under outliers; n = 1 cells keep their value; columns without
+    replicated context cells get the mean. Same estimator as experiments/obs_noise/huber.py (numpy)."""
+    B, R, C, K = reps.shape
+    x = torch.where(mask, reps, 0.0).double()
+    n = mask.sum(-1)
+    med = linear_median(x, mask)
+    fac = torch.tensor(HUBER_SCALE_FACTOR + [HUBER_SCALE_FACTOR[-1]] * max(0, K + 1 - len(HUBER_SCALE_FACTOR)),
+                       dtype=x.dtype, device=x.device)[n.clamp(max=len(HUBER_SCALE_FACTOR) - 1)]
+    res = (x - med[..., None]).abs() * fac[..., None]
+    ok = mask & (n >= 2)[..., None] & (torch.arange(R, device=x.device) < n_train)[None, :, None, None]
+    flat = torch.where(ok, res, float('inf')).transpose(1, 2).reshape(B, C, -1)  # (B, C, R*K)
+    cnt = ok.transpose(1, 2).reshape(B, C, -1).sum(-1)
+    srt = flat.sort(-1).values
+    lo, hi = ((cnt - 1).clamp(min=0) // 2), (cnt // 2).clamp(max=flat.shape[-1] - 1)
+    sig = 0.5 * (srt.gather(-1, lo[..., None]) + srt.gather(-1, hi[..., None])).squeeze(-1)  # (B, C) pooled median
+    sig = torch.where(cnt > 0, sig, float('inf'))[:, None, :, None]
+    mu = med
+    for _ in range(iters):
+        w = torch.where(mask, (HUBER_C * sig / (x - mu[..., None]).abs().clamp(min=1e-12)).clamp(max=1.0), 0.0)
+        mu = (w * x).sum(-1) / w.sum(-1).clamp(min=1e-12)
+    mean = x.sum(-1) / n.clamp(min=1)
+    mu = torch.where(torch.isfinite(sig[..., 0]).expand_as(mu), mu, mean)
+    return torch.where(n > 1, mu, mean).to(reps.dtype)
+
+
 def masked_median(v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:  # lower median over valid entries (last dim)
     srt = torch.where(mask, v, float('inf')).sort(dim=-1).values
     return srt.gather(-1, ((mask.sum(-1) - 1).clamp(min=0) // 2)[..., None]).squeeze(-1)
@@ -175,12 +209,21 @@ class ObsNanoTabICL(NanoTabICLv2):
         # 'attn_medg': the same median start with a PER-CELL gate g = rep_gate(cell vector), zero-init. A single global
         # gate stays ~0 because the noise families disagree (Cauchy wants the median, censoring a mean-like center);
         # per cell, each cell can choose. Step 0 == median imputation exactly.
-        if center == 'attn_medg':
-            self.rep_gate = nn.Linear(d_s + 1, 1)
+        # 'attn_meang': the mirror image, mean start: center = mean + gate * (attention center - mean); step 0 == mean
+        # imputation. Leaving the mean is triggered by outliers a cell can see in its own residuals, whereas leaving
+        # the median toward the mean needs knowing the noise is Gaussian (not identifiable from 3 replicates).
+        # (two gates for the mean start: with zero-init scores the attention center starts AT the mean, so a single gate
+        # on (attention center - mean) would get no gradient (deadlock); the median term breaks it from step 0:
+        # center = mean + g1 (median - mean) + g2 (attention center - mean))
+        # 'attn_huberg': Huber start (huber_location, column-pooled scale): center = huber + g1 (median - huber) +
+        # g2 (attention center - huber); step 0 == Huber imputation (about the mean under Gaussian noise, the median under
+        # outliers: the strongest simple baseline on the LINCS dev tasks, +1.0 over the mean)
+        if center in ('attn_medg', 'attn_meang', 'attn_huberg'):
+            self.rep_gate = nn.Linear(d_s + 1, 1 if center == 'attn_medg' else 2)
             nn.init.zeros_(self.rep_gate.weight)
             nn.init.zeros_(self.rep_gate.bias)
         self.rep_enc = ReplicateEncoder(d_s=d_s, n_heads=rep_heads, use_sab=use_sab, use_null=use_null,
-                                        med_feat=med_feat, loc_head=center in ('attn', 'attn_med', 'attn_medg'), robust_feats=robust_feats, pool=pool,
+                                        med_feat=med_feat, loc_head=center in ('attn', 'attn_med', 'attn_medg', 'attn_meang', 'attn_huberg'), robust_feats=robust_feats, pool=pool,
                                         col_ctx=col_ctx, n_sab=n_sab, col_tok=col_tok)
         # col_tok: richer column context. Every CONTEXT cell of a column (replicated or single) is summarized as
         # [median z, log n, log(1 + MAD z), share of limit ties, n == 1] (+ its row's label with col_tok_target, context
@@ -265,7 +308,7 @@ class ObsNanoTabICL(NanoTabICLv2):
         taus = torch.tensor(self.AUX_TAUS, device=q.device)
         diff = zt[:, None] - q
         loss = torch.maximum(taus * diff, (taus - 1) * diff).mean()
-        if self.center in ('attn', 'attn_med', 'attn_medg') and self.aux_center:
+        if self.center in ('attn', 'attn_med', 'attn_medg', 'attn_meang', 'attn_huberg') and self.aux_center:
             zc = clip((x_c.float() - mu.float()) / sd.float())[multi]
             loss = loss + (zc - zt).abs().mean()
         return loss
@@ -396,7 +439,7 @@ class ObsNanoTabICL(NanoTabICLv2):
             else:
                 vec, scores = self.rep_enc(*enc_args, ctx_fn=ctx_fn, ctx_tokens=ctx_tokens)
             cell[multi] = vec.to(cell.dtype)
-            if self.center in ('attn', 'attn_med', 'attn_medg'):  # learned location: softmax-weighted replicates, n = 1 keep x
+            if self.center in ('attn', 'attn_med', 'attn_medg', 'attn_meang', 'attn_huberg'):  # learned location
                 w = torch.softmax(scores.float().masked_fill(~mask[multi], float('-inf')), dim=-1)
                 att = (w * reps[multi]).sum(-1)
                 x_c = x.clone()
@@ -406,6 +449,11 @@ class ObsNanoTabICL(NanoTabICLv2):
                 elif self.center == 'attn_medg':
                     med = linear_median(reps[multi], mask[multi])
                     att = med + self.rep_gate(vec.to(self.rep_gate.weight.dtype)).float().squeeze(-1) * (att - med)
+                elif self.center in ('attn_meang', 'attn_huberg'):
+                    mu = (x[multi] if self.center == 'attn_meang' else huber_location(reps, mask, n_train)[multi]).float()
+                    gt = self.rep_gate(vec.to(self.rep_gate.weight.dtype)).float()
+                    med = linear_median(reps[multi], mask[multi])
+                    att = mu + gt[:, 0] * (med - mu) + gt[:, 1] * (att - mu)
                 x_c[multi] = att.to(x.dtype)
         if self.aux and self.training:  # kept for aux_loss(); mu / sd: (B, 1, C) column standardization
             self._aux_state = (multi, vec, x_c, mu[..., 0], sd[..., 0])

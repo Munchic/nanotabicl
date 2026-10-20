@@ -1632,3 +1632,101 @@ Comparison script: [compare_tx.py](experiments/obs_noise/compare_tx.py).
 - Sampling weights: contam 6, Gaussian 3, Student-t₃ / plate / constant-CV 2, all other modes 1 (≈ 58% near-Gaussian; robustness to the rest kept).
 - Earlier noise streams are unchanged.
 - **Run `tx_obs_real_A`:** stage A, capacity config, per-cell median start, 6000 steps. Then a stage B from it (`tx_obs_realB`). Both evaluated on the LINCS splits and the 27 synthetic datasets ([lane5.sh](experiments/obs_noise/lane5.sh)).
+
+**Do the v2-prior models transfer to real data? (prior fixed before any real data was seen)**
+
+Accuracy, all replicates; Δ vs the wrapper with median imputation, 8 estimators (ours: 8 passes); paired over tasks.
+
+| | LINCS dose split (dev, 10 tasks) | Gas drift (held-out test, 9 tasks: context batch b → test b + 1) |
+|---|---|---|
+| wrapper + mean, 8 est. | 0.657, **+8.1 ± 1.2 (10/10)** | 0.801, −1.4 ± 0.9 |
+| wrapper + median, 8 est. | 0.576 | **0.816** |
+| TabICLv2 + mean, our pipeline | 0.656, +8.0 | 0.797, −1.9 |
+| TabICLv2 + median, our pipeline | 0.576, 0.0 | 0.809, −0.7 |
+| stage A (v2 prior) | 0.625, +4.9 ± 0.8 (9/10) | 0.796, −2.0 ± 1.3 |
+| **stage B (v2 prior)** | **0.642, +6.6 ± 1.2 (10/10)** | **0.786, −3.0 ± 1.0 (2/9)** |
+| best 1M models (1 pass) | 0.36–0.37 | 0.71 |
+
+- **The v2 prior does not transfer well enough.**
+  - On LINCS the branch beats median imputation by a lot but trails plain mean imputation (−1.5).
+  - On gas drift (held out, untuned) it brings nothing and stage B is slightly worse.
+- **Gas drift's error is dominated by the batch-to-batch drift and by unit-to-unit sensor bias** (replicates are different physical sensors). The synthetic prior has neither.
+  - Task accuracies range from 0.2 (batch 9 → 10) to 0.99.
+  - Ensembling over feature orders matters there: the wrapper goes from 0.787 to 0.816 with 1 → 8 estimators.
+  - Stage A's apparent 1-pass lead (0.804 vs 0.787) disappears with 8 passes.
+- Our pipeline's lower gas log-loss (0.68 vs 0.87) comes from the pipeline (no 0.9 softmax sharpening), not from the branch.
+- **Takeaway:** synthetic gains need a prior that resembles the real measurement process. The v3 prior (near-Gaussian-dominated) is the test: LINCS (dev) should close the gap to the mean; gas drift (held out) should at least not lose.
+
+**Tox21 (held-out test).** Loader `real_data.py --datasets Tox21`:
+- rows = substances screened in all 12 assays;
+- columns = per-run log10 AC50 (inactive runs censored at the top tested concentration) and efficacy of 11 assays (22 columns);
+- replicates = the 3–4 screening runs (independent across assays);
+- target = the 12th assay's call (majority of runs active → 1, none → 0, otherwise dropped);
+- 12 tasks, 1000 / 1000 stratified, 2–16% actives.
+
+ROC-AUC (12 tasks):
+
+| | 1 run | 2 | all | Δ vs wrapper + median, 1 est. |
+|---|---|---|---|---|
+| wrapper (mean / median, 1 / 8 est.) | 0.886 | 0.894–0.895 | 0.899–0.901 | ±0.2 |
+| TabICLv2 + mean / median, our pipeline | 0.886 | 0.894 | 0.899 | 0.0 |
+| stage A / B (v2 prior) | 0.886–0.887 | 0.892–0.895 | 0.900 / 0.901 | +0.1 / +0.2 ± 0.2 |
+| best 1M | 0.873 | 0.881 | 0.888 | −1.1 |
+
+- Replicate runs help everyone (+1.3 AUC points from 1 run to all), but **the branch adds nothing over simple imputation**: each run is already a fitted AC50, so run-to-run noise is small relative to the signal.
+
+**Summary of real-data transfer (v2 prior):**
+- the branch is never worse than median imputation;
+- it is much better on LINCS (+6.6);
+- it is on par with the best simple imputation on Tox21 and gas drift;
+- it is below mean imputation on LINCS (−1.5).
+
+The synthetic gains (+2 accuracy / −0.03 CRPS vs the wrapper) do not carry over to these real datasets as gains over the best simple baseline.
+
+**Why the branch trails the mean on LINCS: the learned center is not noise-adaptive.**
+
+Center position between the cell median (0) and the cell mean (1), median over replicated cells:
+
+| | LINCS cells | synthetic Gaussian | synthetic Cauchy | synthetic heavy censoring | synthetic `fail_floor` |
+|---|---|---|---|---|---|
+| per-cell-gate stage A (v2) | 0.02 | +0.05 | +0.00 | +0.02 | +0.03 |
+| stage B (v2) | −0.03 | | | | |
+| v3 stage A, step 1500 | 0.03 | +0.06 | +0.01 | +0.09 | +0.01 |
+| mean-start stage A (v2) | −0.05 | +0.13 | −0.05 | +0.01 | +0.02 |
+
+- **Every model feeds the backbone a median-like value for every noise family**, even Gaussian, and even the mean-start run, which learned to move there. The synthetic gains come through the branch's embeddings, not through a better point estimate.
+- **On LINCS that costs averaging efficiency.** Wrapper, 1 est., dose split: mean of wells 0.653, per-feature median 0.577, first well only 0.546, medoid well 0.455. So it is averaging (+11 points over one well) that matters, not well coherence; the medoid result rules out a pairing explanation.
+- **Replicate sd / column sd:** L1000 0.81, Cell Painting 0.39, gas drift 0.25, Tox21 0.18 (prior: logU(0.1, 1), median 0.32). The low noise in gas drift and Tox21 explains why replicate handling does not matter there.
+- **Cause in the prior:** mean vs median barely affects the loss in its Gaussian modes (moderate noise, 5.5 replicates on average), while the heavy-tail modes reward the median strongly. The v3 weights alone did not change this (center 0.03 at step 1500; LINCS dev −4.3 vs mean). **`tx_obs_real_A` was stopped at about step 1700.**
+
+**v4 prior (synthetic only): add efficiency pressure.**
+- `--scale_max 2` (noise scale logU(0.1, 2) × sd) and `--small_k_prob 0.5` (half of the tables with U{2..5} replicates, as in real assays), on top of the v3 mixture. Defaults reproduce the old streams.
+- **Mean start with a per-cell gate (`center: 'attn_meang'`):** center = mean + g₁ (median − mean) + g₂ (attention center − mean), both gates zero-init.
+  - Step 0 equals TabICLv2 + mean imputation exactly (0.0).
+  - The median term breaks the zero-gradient deadlock: a single gate on (attention center − mean) gets no gradient at step 0, because zero-init scores put the attention center at the mean (grad norms 0.13 vs 6e-8).
+  - **Rationale:** leaving the mean is triggered by outliers a cell can see in its own residuals; leaving the median toward the mean needs to know the noise is Gaussian, which 3 replicates cannot reveal.
+- **Screens ([lane6.sh](experiments/obs_noise/lane6.sh)):** `tx_v4med_A` (median start) vs `tx_v4mean_A` (mean start). Base branch size (two jobs fit), 3000 steps. Then the LINCS dev evaluation, the center diagnostic and the 27-dataset synthetic evaluation. Gas drift and Tox21 stay untouched until a v4 configuration is chosen.
+
+**v4 screens (3000 steps, base branch size), LINCS dose split (dev):**
+
+| | acc, all wells | log-loss | vs wrapper + mean, 1 est. | center position on LINCS (median 0 → mean 1) |
+|---|---|---|---|---|
+| v2 stage A (per-cell gate, 6000 steps) | 0.624 | 1.121 | −2.9 ± 0.7 | 0.02 |
+| v2 stage B | 0.640 | 1.068 | −1.3 ± 1.1 | −0.03 |
+| **v4 median start** | 0.641 | 1.073 | −1.3 ± 0.9 | 0.01 |
+| **v4 mean start** | 0.642 | 1.054 | −1.1 ± 0.6 | 0.24–0.28 |
+
+- The v4 prior lifts stage A by +1.7, in half the steps, to the level of the old stage B. It still trails the mean.
+- **Even the mean start drifts toward the median**, and adapts only weakly to the noise family (synthetic Gaussian 0.35 vs Cauchy 0.16).
+- Synthetic validation shows the same: on Gaussian noise mean imputation beats median by +0.5, but the models reach +0.2 / +0.4.
+- **Reason:** the gate is a linear head on a cell vector built from 2–5 replicates, which cannot tell Gaussian from heavy-tailed cells. Heavy-tailed cells dominate the gradient, so the model robustifies everywhere.
+
+**Huber imputation with a column-pooled scale** ([huber.py](experiments/obs_noise/huber.py); torch `obs_model.huber_location`, equal to 9e-16).
+- Scale: median over the column's replicated context cells of |replicate − cell median| × the Gaussian small-n factor for the cell size (simulated; odd n larger, because the median replicate has residual 0). IRLS with c = 1.345.
+- Simulation (2–5 replicates), RMSE vs the clean value: Gaussian — mean 0.279, median 0.304, **Huber 0.281**; 5% outliers at 20× — 1.233, 0.863, **0.858**.
+- **LINCS dose (dev), wrapper:** Huber 0.663 / 0.656 (1 / 8 est.), mean 0.653 / 0.657, median 0.577 / 0.576. **Huber − mean = +1.0 ± 0.5 (6/10) with 1 est.**
+- **Huber start (`center: 'attn_huberg'`):** center = Huber + g₁ (median − Huber) + g₂ (attention center − Huber).
+  - Step 0 equals TabICLv2 + Huber imputation exactly (0.0).
+  - Both gates get gradient at step 0 (0.17 / 2.6).
+- **Matched baseline:** imputation mode `huber` (`obs_train` / `obs_eval` / `real_eval`).
+- **Runs ([lane7.sh](experiments/obs_noise/lane7.sh)):** `tx_huber0p` (reference) and `tx_v4huber_A` (v4 prior, 3000 steps).

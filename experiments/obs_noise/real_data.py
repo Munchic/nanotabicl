@@ -152,6 +152,75 @@ def build_gas(max_rows=1000):
     json.dump(dict(dataset='GasDrift', role='held-out test', tasks=tasks), open(os.path.join(out_dir, 'manifest.json'), 'w'), indent=1)
 
 
+TOX = os.path.join(ROOT, 'artifacts', 'real_raw', 'tox21')
+TOX_ASSAYS = ['ar-mda-kb2-luc-agonist-p1', 'ar-bla-agonist-p1', 'ahr-p1', 'aromatase-p1', 'er-luc-bg1-4e2-agonist-p2',
+              'er-bla-agonist-p2', 'pparg-bla-agonist-p1', 'are-bla-p1', 'elg1-luc-agonist-p1', 'hse-bla-p1', 'mitotox-p1',
+              'p53-bla-p1']  # the 12 MoleculeNet Tox21 tasks (NR-AR ... SR-p53)
+
+
+def build_tox21(max_rows=1000):
+    """Tox21 qHTS: rows = substances (TOX21_ID); columns = per-run log10 AC50 [uM] and efficacy of 11 assays (ratio
+    channel); replicates = the substance's screening runs (3-4; independent across assays). Inactive runs have no AC50:
+    reported at the top tested concentration (right-censoring) with efficacy 0. Target: the 12th assay's call (active if
+    the majority of its runs are active, inactive if none is, otherwise dropped); one task per held-out assay; context
+    and test <= max_rows each, stratified by class (seeded). Held-out test set."""
+    runs = {}
+    for a in TOX_ASSAYS:
+        d = pd.read_csv(os.path.join(TOX, f'tox21-{a}', f'tox21-{a}.txt'), sep='\t', index_col=False, low_memory=False)
+        # the primary readout, one row per run: set1-3 (luciferase), ratio / ratio_1-3 (bla), antagonist1-3 (aromatase),
+        # agonist (elg1); channel / viability rows are dropped
+        d = d[d['SAMPLE_DATA_TYPE'].astype(str).str.match(r'^(set\d|ratio(_\d)?|antagonist\d|agonist)$')]
+        conc = d[[c for c in d.columns if c.startswith('CONC')]].to_numpy(np.float64)
+        top_um = np.nanmax(conc, 1) * 1e6
+        ac50 = d['AC50'].to_numpy(np.float64)
+        logac = np.log10(np.where(np.isfinite(ac50), ac50, top_um))  # inactive -> censored at the top concentration
+        eff = np.where(np.isfinite(ac50), d['EFFICACY'].to_numpy(np.float64), 0.0)
+        active = d['ASSAY_OUTCOME'].astype(str).str.startswith('active').to_numpy()
+        runs[a] = pd.DataFrame({'id': d['TOX21_ID'].to_numpy(), 'logac': logac, 'eff': np.nan_to_num(eff), 'active': active})
+        print('tox21', a, len(d), 'runs', flush=True)
+    ids = sorted(set.intersection(*[set(r['id']) for r in runs.values()]))
+    pos = {i: j for j, i in enumerate(ids)}
+    n = len(ids)
+    out_dir = os.path.join(OUT, 'Tox21')
+    os.makedirs(out_dir, exist_ok=True)
+    tasks = []
+    for t, target in enumerate(TOX_ASSAYS):
+        feats = [a for a in TOX_ASSAYS if a != target]
+        reps = np.full((n, 2 * len(feats), K_MAX), np.nan, dtype=np.float32)
+        cnt = np.zeros((n, 2 * len(feats)), dtype=np.int8)
+        for j, a in enumerate(feats):
+            r = runs[a][runs[a]['id'].isin(pos)]  # substances screened in all 12 assays
+            for col, v in ((2 * j, 'logac'), (2 * j + 1, 'eff')):
+                for i, val in zip(r['id'].map(pos), r[v]):
+                    k = cnt[i, col]
+                    if k < K_MAX:
+                        reps[i, col, k] = val
+                        cnt[i, col] = k + 1
+        g = runs[target].groupby('id')['active'].agg(['mean', 'size'])
+        lab = np.full(n, -1)
+        for i_, (m, _) in g.iterrows():
+            if i_ in pos:
+                lab[pos[i_]] = 1 if m > 0.5 else (0 if m == 0 else -1)
+        ok = np.where((lab >= 0) & (cnt.min(1) > 0))[0]
+        rng = np.random.default_rng([t, 13])
+        tr, te = [], []
+        for c in (0, 1):  # stratified: each class split half / half, then capped
+            idx = rng.permutation(ok[lab[ok] == c])
+            half = len(idx) // 2
+            tr.append(idx[:half]); te.append(idx[half:])
+        tr, te = np.concatenate(tr), np.concatenate(te)
+        tr = rng.permutation(tr)[:max_rows] if len(tr) > max_rows else tr
+        te = rng.permutation(te)[:max_rows] if len(te) > max_rows else te
+        rows = np.concatenate([tr, te])
+        name = f'target_{t + 1:02d}'
+        np.savez_compressed(os.path.join(out_dir, name + '.npz'), replicates=reps[rows], counts=cnt[rows], y=lab[rows],
+                            train_idx=np.arange(len(tr)), test_idx=np.arange(len(tr), len(rows)), group=np.array(ids)[rows],
+                            meta=json.dumps(dict(dataset='Tox21', task=name, target=target, features=feats)))
+        tasks.append(dict(task=name, target=target, n_train=int(len(tr)), n_test=int(len(te)), pos_rate=float(lab[rows].mean())))
+        print('Tox21', name, target, f'context {len(tr)}, test {len(te)}, active share {lab[rows].mean():.3f}', flush=True)
+    json.dump(dict(dataset='Tox21', role='held-out test', tasks=tasks), open(os.path.join(out_dir, 'manifest.json'), 'w'), indent=1)
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--datasets', default='L1000,CellPainting')
@@ -163,5 +232,7 @@ if __name__ == '__main__':
     for ds in a.datasets.split(','):
         if ds == 'GasDrift':
             build_gas()
+        elif ds == 'Tox21':
+            build_tox21()
         else:
             build(ds, a.n_components, a.n_tasks, a.split)

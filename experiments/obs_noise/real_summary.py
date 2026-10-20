@@ -14,22 +14,24 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--suffix', default='_dose')
 ap.add_argument('--ref', default='tabicl_mean_e8')
 ap.add_argument('--models', default=','.join(MODELS))
+ap.add_argument('--datasets', default='', help='comma-separated dataset names (overrides --suffix)')
+ap.add_argument('--metric', default='acc', help='acc or auc (Tox21: auc)')
 a = ap.parse_args()
-dsets = [f'L1000{a.suffix}', f'CellPainting{a.suffix}']
+dsets = a.datasets.split(',') if a.datasets else [f'L1000{a.suffix}', f'CellPainting{a.suffix}']
 R = defaultdict(dict)
 for r in map(json.loads, open(os.path.join(ROOT, 'artifacts', 'real_eval.jsonl'))):
     if r['dataset'] in dsets:
         R[(r['model'], str(r['k']))][(r['dataset'], r['task'])] = r
-print(f'| model | acc, 1 well | acc, 2 | acc, 3 | acc, all | log-loss all | ECE all | Δacc all vs {a.ref} | Δlog-loss all vs {a.ref} |')
+print(f'| model | {a.metric}, 1 rep | 2 | 3 | all | log-loss all | ECE all | Δ{a.metric} all vs {a.ref} (points) | Δlog-loss all vs {a.ref} |')
 print('|---|---|---|---|---|---|---|---|---|')
 for m in a.models.split(','):
     if not R[(m, 'all')]:
         continue
     ts = sorted(R[(m, 'all')])
     mean = lambda k, key: np.mean([R[(m, k)][t][key] for t in ts]) if R[(m, k)] else float('nan')
-    d = np.array([R[(m, 'all')][t]['acc'] - R[(a.ref, 'all')][t]['acc'] for t in ts]) * 100
+    d = np.array([R[(m, 'all')][t][a.metric] - R[(a.ref, 'all')][t][a.metric] for t in ts]) * 100
     dl = np.array([R[(m, 'all')][t]['log_loss'] - R[(a.ref, 'all')][t]['log_loss'] for t in ts])
     se = lambda v: v.std(ddof=1) / np.sqrt(len(v))
-    print(f"| {m} | {mean('1', 'acc'):.3f} | {mean('2', 'acc'):.3f} | {mean('3', 'acc'):.3f} | {mean('all', 'acc'):.3f} | "
+    print(f"| {m} | {mean('1', a.metric):.3f} | {mean('2', a.metric):.3f} | {mean('3', a.metric):.3f} | {mean('all', a.metric):.3f} | "
           f"{mean('all', 'log_loss'):.3f} | {mean('all', 'ece'):.3f} | {d.mean():+.1f} ± {se(d):.1f} ({(d > 0).sum()}/{len(d)}) | "
           f"{dl.mean():+.3f} ± {se(dl):.3f} ({(dl < 0).sum()}/{len(dl)}) |")

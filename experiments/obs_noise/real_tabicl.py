@@ -4,13 +4,23 @@ Records -> artifacts/real_eval.jsonl (model = tabicl_<arm>_e<n_estimators>)."""
 import glob, json, os, sys, warnings
 
 import numpy as np
-from sklearn.metrics import accuracy_score, log_loss
+from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
 
 warnings.filterwarnings('ignore')
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 BINS = np.linspace(0, 1, 16)
+
+
+def auc(y, p):  # ROC-AUC: binary on p[:, 1]; multiclass one-vs-rest macro over the classes present in y
+    present = np.unique(y)
+    if len(present) < 2:
+        return float('nan')
+    if p.shape[1] == 2:
+        return float(roc_auc_score(y, p[:, 1]))
+    q = p[:, present] / p[:, present].sum(1, keepdims=True)
+    return float(roc_auc_score(y, q, multi_class='ovr', labels=present)) if len(present) > 2 else float(roc_auc_score(y == present[1], q[:, 1]))
 
 
 def calib_stats(p, y):  # = calib.calib_stats (top-label ECE, 15 bins; overconfidence); calib imports matplotlib
@@ -32,7 +42,7 @@ def main():
     datasets = sys.argv[1].split(',') if len(sys.argv) > 1 else ['L1000', 'CellPainting']
     out = os.path.join(ROOT, 'artifacts', 'real_eval.jsonl')
     for ds in datasets:
-        for f in sorted(glob.glob(os.path.join(ROOT, 'artifacts', 'real', ds, 'moa*.npz'))):
+        for f in sorted(glob.glob(os.path.join(ROOT, 'artifacts', 'real', ds, '*.npz'))):
             z = np.load(f)
             tr, te, y = z['train_idx'], z['test_idx'], z['y']
             n_cls = int(y.max()) + 1
@@ -43,11 +53,14 @@ def main():
                 r = np.where(mask, np.nan_to_num(z['replicates']), np.nan)
                 for arm, X in [('mean', np.nanmean(r, -1)), ('median', np.nanmedian(r, -1))]:
                     for n_est in (1, 8):
-                        p = np.clip(predict(ckpt, X[tr], y[tr], X[te], n_est), 1e-7, 1)
+                        seen = np.unique(y[tr])  # the wrapper's classes_ (LabelEncoder: sorted context labels)
+                        p = np.zeros((len(te), n_cls))
+                        p[:, seen] = predict(ckpt, X[tr], y[tr], X[te], n_est)  # classes absent from the context: 0
+                        p = np.clip(p, 1e-7, 1)
                         p /= p.sum(1, keepdims=True)
                         c = calib_stats(p, y[te])
                         recs.append(dict(model=f'tabicl_{arm}_e{n_est}', dataset=ds, task=os.path.basename(f)[:-4], k=k,
-                                         n_ens=n_est, acc=accuracy_score(y[te], p.argmax(1)),
+                                         n_ens=n_est, acc=accuracy_score(y[te], p.argmax(1)), auc=auc(y[te], p),
                                          log_loss=log_loss(y[te], p, labels=np.arange(n_cls)), ece=float(c['ece']),
                                          overconf=float(c['overconf'])))
             with open(out, 'a') as fh:
