@@ -14,7 +14,7 @@ import numpy as np, torch, torch.nn.functional as F
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, '..', '..'))
 from model import NanoTabICLv2  # noqa: E402
-from obs_model import ObsNanoTabICL, huber_location  # noqa: E402
+from obs_model import ObsNanoTabICL, huber_location, fill_missing  # noqa: E402
 from tabicl_port import load_tabicl  # noqa: E402
 
 K = 10
@@ -26,6 +26,11 @@ NOISES_V2 = NOISES + ['fail_floor', 'fail_shift', 'cv_lognormal', 'lod_logistic'
 # 2-3% outliers, otherwise ~Gaussian); with --noise_weights the mixture can be tilted toward it
 NOISES_V3 = NOISES_V2 + ['contam']
 CONTAM_ID = NOISES_V3.index('contam')
+# v5 (Exp 9, real-shaped): + 'gauss_rowhet', Gaussian with a lognormal(0, 0.5) per-row scale (rows / samples of unequal
+# quality); used with large noise, few wells and a Gaussian-dominated mixture (see --noise_weights / --scale_min)
+NOISES_V5 = NOISES_V3 + ['gauss_rowhet']
+ROWHET_ID = NOISES_V5.index('gauss_rowhet')
+SCALE_MIN = 0.1  # --scale_min
 SCALE_MAX = 1.0  # --scale_max: noise scale ~ logU(0.1, SCALE_MAX) x column sd (1.0 = the original prior)
 SMALL_K_PROB = 0.0  # --small_k_prob: share of tables whose cells get U{2..5} replicates (0 = the original stream)
 NOISE_W = None  # --noise_weights: sampling weights over TRAIN_NOISES (None = uniform, the original stream)
@@ -37,6 +42,7 @@ def sample_ids(shape, g, dev):
     w = NOISE_W.to(dev)
     return torch.multinomial(w, math.prod(shape), replacement=True, generator=g).view(shape)
 TRAIN_NOISES = NOISES  # set by --noise_set; v1 keeps the original training mixture and RNG stream
+NOISE_SET = 'v1'  # v6: training batches from observe_v6 (the continuous prior) instead of observe
 N_VAL = 16
 VAL_CHUNK = 8
 VAL_BLOCKS, VAL_NOISES = N_VAL, None  # --val_blocks / --val_noises: cheaper validation (e.g. for the 27M model)
@@ -57,7 +63,7 @@ def noise_layout(layout, B, R, C, n_groups, g, dev):
     colgroup: own model + scale per (group, column). Group layouts: each group's replicate count is capped at
     U{1..K} w.p. 0.5 (e.g. one lab runs singles, another triplicates)."""
     n_id = len(TRAIN_NOISES)
-    logu = lambda *shape: torch.exp(torch.empty(*shape, device=dev).uniform_(math.log(0.1), math.log(SCALE_MAX), generator=g))
+    logu = lambda *shape: torch.exp(torch.empty(*shape, device=dev).uniform_(math.log(SCALE_MIN), math.log(SCALE_MAX), generator=g))
     precise = gid = cap = None
     if layout == 'col':
         ids, sc = sample_ids((B, 1, C, 1), g, dev), logu(B, 1, C, 1)
@@ -86,8 +92,8 @@ def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None
     K = k_max or globals()['K']  # tensor width = max replicates per cell in this batch
     col_sd = X.std(dim=1, keepdim=True).clamp(min=1e-12)[..., None]  # (B, 1, C, 1)
     if scale is None:
-        scale = torch.exp(torch.empty(B, 1, 1, 1, device=dev).uniform_(math.log(0.1), math.log(SCALE_MAX), generator=g))
-    noise_ids = (torch.full((B,), NOISES_V3.index(noise), device=dev) if noise is not None
+        scale = torch.exp(torch.empty(B, 1, 1, 1, device=dev).uniform_(math.log(SCALE_MIN), math.log(SCALE_MAX), generator=g))
+    noise_ids = (torch.full((B,), NOISES_V5.index(noise), device=dev) if noise is not None
                  else sample_ids((B,), g, dev))
     nid = noise_ids[:, None, None, None]
     precise = cap = None
@@ -115,7 +121,8 @@ def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None
         out = torch.rand(B, R, C, K, device=dev, generator=g) < p_out
         wide = torch.exp(torch.empty(B, R, C, K, device=dev).uniform_(math.log(3), math.log(30), generator=g))
         eps = torch.where((nid == CONTAM_ID) & out, gauss * wide, eps)
-    row_scale = torch.where(nid == 4, torch.exp(torch.randn(B, R, 1, 1, device=dev, generator=g)), 1.0)
+    row_draw = torch.randn(B, R, 1, 1, device=dev, generator=g)  # one draw for both (the earlier streams are unchanged)
+    row_scale = torch.where(nid == 4, torch.exp(row_draw), torch.where(nid == ROWHET_ID, torch.exp(0.5 * row_draw), 1.0))
     # value-dependent heteroscedasticity (valhet): scale = 2 * percentile rank of the clean value in its column
     u = (X.argsort(dim=1, stable=True).argsort(dim=1, stable=True) + 1).to(X.dtype) / R
     val_scale = torch.where((nid == 5) | (nid == 6), 2 * u[..., None], 1.0)
@@ -142,7 +149,8 @@ def observe(X, g, noise=None, scale=None, p_clean=0.0, censor_q=None, lod_q=None
     if (nid >= len(NOISES)).any():  # Exp 6 modes (only drawn with --noise_set v2 or when evaluating them)
         reps = observe_v2(X, reps, nid, col_sd, scale, eps, g)
     counts = torch.randint(1, K + 1, (B, R, C, 1), device=dev, generator=g)
-    if SMALL_K_PROB > 0:  # v4: a share of tables with few replicates per cell, U{2..5} (as in real assays, 3-5 wells)
+    if SMALL_K_PROB > 0 and regimes is not None:  # v4, training batches only (validation keeps its fixed design):
+        # a share of tables with few replicates per cell, U{2..5} (as in real assays, 3-5 wells)
         small = torch.rand(B, 1, 1, 1, device=dev, generator=g) < SMALL_K_PROB
         counts = torch.where(small, torch.randint(2, 6, (B, R, C, 1), device=dev, generator=g), counts)
     if regimes is not None:  # per-table count regime (Exp 5); None keeps the original per-cell draw (and RNG stream)
@@ -192,6 +200,115 @@ def observe_v2(X, reps, nid, col_sd, scale, eps, g):
     for i, v in enumerate([fail_floor, fail_shift, cv, lod, sat, plate]):
         out = torch.where(nid == len(NOISES) + i, v, out)
     return out
+
+
+# ----- v6: continuous replicate prior (Exp 10) -----
+# Instead of one named noise model per table, every table draws its own observation process from continuous families
+# and the components combine freely. P6 = probability that a table has each component (validation settings override
+# them, see V6_SETTINGS); within a component every strength is drawn from a continuous range.
+P6 = dict(p_tail=0.5, p_contam=0.35, p_rowhet=0.4, p_valhet=0.35, p_colhet=0.7, p_well=0.4, p_plate=0.3, p_fail=0.2,
+          p_lod=0.35, p_uloq=0.12, p_mcar=0.3, p_spec=0.5, p_precise=0.3, p_test1=0.1, sub=None, scale=None)
+V6_SETTINGS = {  # fixed-seed validation draws: the default mixture and single components at full probability
+    'v6': {},
+    'v6_gauss': dict(p_tail=0, p_contam=0, p_rowhet=0, p_valhet=0, p_well=0, p_plate=0, p_fail=0, p_lod=0, p_uloq=0, p_mcar=0),
+    'v6_heavy': dict(p_tail=1, p_contam=1),
+    'v6_paired': dict(p_well=1, p_plate=1),
+    'v6_fail': dict(p_fail=1),
+    'v6_mnar': dict(p_lod=1, sub=0, p_mcar=1),     # undetected replicates are absent (informative counts, n = 0 cells)
+    'v6_lod_flag': dict(p_lod=1, sub=1, p_spec=1),  # undetected -> at the limit, flagged '<'
+    'v6_lod_noflag': dict(p_lod=1, sub=1, p_spec=0),  # the same draws with the flags hidden
+}
+P6_TRAIN = dict(P6)  # --p6: the training mixture (validation keeps P6 + V6_SETTINGS, so runs stay comparable)
+COUNT_DESIGN = [0.05, 0.2, 0.3, 0.15, 0.1, 0.1, 0.1]  # per table: n = 1, 2, 3, 4, 5, U{6..K} per table, U{1..K} per cell
+
+
+def observe_v6(X, g, n_train, k_max=None, p_clean=0.0, **over):
+    """X: (B, R, C) clean. -> reps (B, R, C, K), mask (B, R, C, K), flags (B, R, C, K) int64.
+    reps: censored replicates reported AT their limit (or substituted, see 'sub'); mask: measured replicates, holes
+    allowed, n = 0 cells allowed (all replicates missing); flags: 0 observed / not reported, 1 '<' (below a lower
+    limit), 2 '>' (above an upper limit), shown only in tables with the spec (p_spec).
+    Replicate index k is one physical well / run / sample of the row, the same for every column (paired tables)."""
+    P = dict(P6, **over)
+    B, R, C = X.shape
+    dev = X.device
+    K_ = k_max or K
+    U = lambda *sh, lo=0.0, hi=1.0: torch.empty(*sh, device=dev).uniform_(lo, hi, generator=g)
+    logU = lambda *sh, lo, hi: torch.exp(U(*sh, lo=math.log(lo), hi=math.log(hi)))
+    N = lambda *sh: torch.randn(*sh, device=dev, generator=g)
+    on = lambda key: U(B, 1, 1, 1) < P[key]  # (B, 1, 1, 1): table has this component
+    col_sd = X.std(dim=1, keepdim=True).clamp(min=1e-12)[..., None]  # (B, 1, C, 1)
+    Xs = X.sort(dim=1).values
+    col_q = lambda q: Xs.gather(1, (q.clamp(0, 1) * (R - 1)).round().long().expand(B, 1, C))[..., None]  # q: (B, 1, C)
+    # noise scale: per table logU(0.05, 2) x column sd, columns spread around it (p_colhet)
+    sig = logU(B, 1, 1, 1, lo=0.05, hi=2.0) if P['scale'] is None else torch.full((B, 1, 1, 1), float(P['scale']), device=dev)
+    sig = sig * torch.exp(on('p_colhet') * U(B, 1, 1, 1) * N(B, 1, C, 1)).clamp(max=4.0)
+    # tails: eps = gauss / |gauss'|^a, a in [0, 1]: Gaussian (a = 0) ... Cauchy (a = 1), tail index ~ 1 / a
+    a = on('p_tail') * U(B, 1, 1, 1) ** 1.5
+    a = (a + 0.15 * N(B, 1, C, 1) * (a > 0)).clamp(0, 1)  # columns of a table share roughly the same tail
+    eps = N(B, R, C, K_) / N(B, R, C, K_).abs().clamp(min=1e-4) ** a
+    # contamination: a share p ~ U(0, 0.1) of replicates are outliers, logU(3, 30) x wider, symmetric or one-sided
+    p_out = on('p_contam') * 0.1 * U(B, 1, 1, 1)
+    out = U(B, R, C, K_) < p_out
+    wide = logU(B, R, C, K_, lo=3.0, hi=30.0) * N(B, R, C, K_)
+    side = torch.where(U(B, 1, 1, 1) < 0.3, torch.sign(N(B, 1, C, 1)), 0.0)  # one-sided outliers (sign per column)
+    eps = torch.where(out, torch.where(side != 0, side * wide.abs(), wide), eps)
+    # heteroscedasticity: per row (unequal sample quality) and with the value (intensity-dependent noise, either sign)
+    row_scale = torch.exp(on('p_rowhet') * U(B, 1, 1, 1, hi=0.8) * N(B, R, 1, 1))
+    beta = on('p_valhet') * U(B, 1, 1, 1, lo=-0.8, hi=0.8)
+    zc = ((X - Xs[:, R // 2:R // 2 + 1]) / col_sd[..., 0]).clamp(-3, 3)[..., None]
+    reps = X[..., None] + sig * col_sd * row_scale * torch.exp(beta * zc) * eps
+    # paired effects: a well / sample effect shared by all columns of the row's replicate k (loadings per column), and a
+    # run / plate effect shared by all rows' replicate k (per column + common part)
+    omega = on('p_well') * U(B, 1, 1, 1)
+    reps = reps + omega * sig * col_sd * U(B, 1, C, 1, lo=0.3, hi=1.5) * N(B, R, 1, K_)
+    pi = on('p_plate') * U(B, 1, 1, 1, hi=0.8)
+    reps = reps + pi * sig * col_sd * (0.7 * N(B, 1, C, K_) + 0.7 * N(B, 1, 1, K_))
+    # replicate design (per table): mostly a fixed small n, sometimes varying by row; aligned across columns
+    design = torch.multinomial(torch.tensor(COUNT_DESIGN, device=dev), B, replacement=True, generator=g)[:, None, None, None]
+    n_tab = torch.where(design < 5, design + 1, torch.randint(min(6, K_), K_ + 1, (B, 1, 1, 1), device=dev, generator=g))
+    n_row = (n_tab - torch.where(U(B, 1, 1, 1) < 0.3, torch.randint(0, 3, (B, R, 1, 1), device=dev, generator=g), 0)).clamp(min=1)
+    n_cell = torch.where(design == 6, torch.randint(1, K_ + 1, (B, R, C, 1), device=dev, generator=g), n_row.expand(B, R, C, 1))
+    test1 = (U(B, 1, 1, 1) < P['p_test1']) & (torch.arange(R, device=dev) >= n_train)[None, :, None, None]
+    n_cell = torch.where(test1, 1, n_cell).clamp(max=K_)  # some tables: new samples measured once
+    mask = torch.arange(K_, device=dev) < n_cell
+    # failed wells: floor value, a large shift, or the well is lost; a failed well fails for all columns w.p. 0.5
+    p_f = on('p_fail') * 0.15 * U(B, 1, 1, 1)
+    failed = torch.where(U(B, 1, 1, 1) < 0.5, U(B, R, 1, K_) < p_f, U(B, R, C, K_) < p_f)
+    f_kind = torch.randint(0, 3, (B, 1, 1, 1), device=dev, generator=g)
+    floor = Xs[:, :1, :, None] - U(B, 1, C, 1, lo=0.5, hi=2.0) * col_sd
+    shift = reps + torch.sign(N(B, 1, C, 1)) * U(B, 1, 1, 1, lo=2.0, hi=6.0) * col_sd
+    reps = torch.where(failed & (f_kind == 0), floor, torch.where(failed & (f_kind == 1), shift, reps))
+    mask = mask & ~(failed & (f_kind == 2))
+    # missing at random: replicates lost independently
+    mask = mask & ~(U(B, R, C, K_) < on('p_mcar') * 0.3 * U(B, 1, 1, 1))
+    # lower detection limit (quantile per column), soft or sharp detection probability on the measured value;
+    # undetected replicates: absent (sub 0: informative counts), at the limit (1, flagged '<' with the spec), or
+    # substituted by a floor below the limit (2, never flagged: how many pipelines report non-detects)
+    flags = torch.zeros(B, R, C, K_, dtype=torch.long, device=dev)
+    lod_on = on('p_lod')
+    lod = col_q(U(B, 1, 1, lo=0.02, hi=0.6) + 0.1 * N(B, 1, C))
+    slope = logU(B, 1, 1, 1, lo=0.02, hi=1.0)
+    undet = lod_on & (U(B, R, C, K_) > torch.sigmoid((reps - lod) / (slope * col_sd)))
+    sub = (torch.multinomial(torch.tensor([0.35, 0.4, 0.25], device=dev), B, replacement=True, generator=g)
+           if P['sub'] is None else torch.full((B,), int(P['sub']), device=dev))[:, None, None, None]
+    lod_floor = lod - U(B, 1, C, 1, lo=0.2, hi=1.5) * col_sd
+    mask = mask & ~(undet & (sub == 0))
+    reps = torch.where(undet & (sub == 1), lod, torch.where(undet & (sub == 2), lod_floor, reps))
+    flags = torch.where(undet & (sub == 1), 1, flags)
+    # upper limit (saturation / ULOQ): reported at the limit, flagged '>' with the spec
+    hi = col_q(U(B, 1, 1, lo=0.8, hi=0.99) + 0.05 * N(B, 1, C))
+    sat = on('p_uloq') & (reps > hi)
+    reps = torch.where(sat, hi, reps)
+    flags = torch.where(sat, 2, flags)
+    flags = torch.where(U(B, 1, 1, 1) < P['p_spec'], flags, 0)
+    # exact columns (covariates / metadata, n = 1, no noise) and exact tables
+    precise = on('p_precise') & (U(B, 1, C, 1) < 0.5 * U(B, 1, 1, 1))
+    exact = precise | (U(B, 1, 1, 1) < p_clean)
+    first = torch.arange(K_, device=dev) == 0
+    reps = torch.where(exact, X[..., None].expand_as(reps), reps)
+    mask = torch.where(exact, first.expand_as(mask), mask)
+    flags = torch.where(exact, 0, flags) * mask
+    return reps, mask, flags
 
 
 REGIMES = ['cell', 'row', 'col', 'ctxq']
@@ -279,7 +396,14 @@ def model_forward(model, mode, X, y_train, g, aux=False, **obs_kw):
     """-> logits, or (logits, auxiliary denoising loss) when aux (obs mode, model built with aux=True)."""
     if mode == 'clean':
         return model(X, y_train)
-    reps, mask = observe(X, g, **obs_kw)
+    flags = None
+    if obs_kw.get('noise') in V6_SETTINGS or (NOISE_SET == 'v6' and obs_kw.get('noise') is None):  # v6 settings / training
+        over = V6_SETTINGS[obs_kw['noise']] if obs_kw.get('noise') in V6_SETTINGS else P6_TRAIN
+        reps, mask, flags = observe_v6(X, g, y_train.shape[1], k_max=obs_kw.get('k_max'), p_clean=obs_kw.get('p_clean', 0.0), **over)
+        if mode != 'obs':
+            reps, mask, _ = fill_missing(reps, mask, y_train.shape[1])
+    else:
+        reps, mask = observe(X, g, **obs_kw)
     if mode == 'mean':
         return model(torch.where(mask, reps, 0).sum(-1) / mask.sum(-1), y_train)
     if mode == 'median':  # median imputation (numpy-equivalent median)
@@ -288,7 +412,7 @@ def model_forward(model, mode, X, y_train, g, aux=False, **obs_kw):
         return model(huber_location(reps, mask, y_train.shape[1]), y_train)
     if mode == 'stats':
         return model(summary_stats(reps, mask), y_train)
-    out = model(reps, mask, y_train)
+    out = model(reps, mask, y_train) if flags is None else model(reps, mask, y_train, flags=flags)
     if not aux:
         return out
     if reps.shape[2] > X.shape[2]:  # visible group column (exact) appended by observe
@@ -361,9 +485,10 @@ def validate(model, mode, bank, dev):
                         logits = model(X, y[:, :n_train])
                     else:
                         m = 'mean' if mode == 'clean' else mode  # clean model sees noisy cell means
-                        logits = model_forward(model, m, X, y[:, :n_train], g, noise=noise,
-                                               scale=torch.tensor(0.5, device=dev), censor_q=(0.1, 0.9),
-                                               lod_q={'censored_left': 0.3, 'censored_left_heavy': 0.6}.get(noise))
+                        fixed = {} if noise in V6_SETTINGS else dict(  # named modes: fixed scale / limits
+                            scale=torch.tensor(0.5, device=dev), censor_q=(0.1, 0.9),
+                            lod_q={'censored_left': 0.3, 'censored_left_heavy': 0.6}.get(noise))
+                        logits = model_forward(model, m, X, y[:, :n_train], g, noise=noise, **fixed)
                 y_test = y[:, n_train:]
                 l, valid = task_loss(logits, y_test, y[:, :n_train])
                 if TASK == 'regression':  # 'loss' = CRPS (~2 x mean pinball), 'acc' = R^2 of the predicted median
@@ -377,6 +502,40 @@ def validate(model, mode, bank, dev):
     model.train()
     torch.cuda.empty_cache()  # give validation memory back to co-running jobs
     return out
+
+
+_DEV_CACHE = {}
+
+
+@torch.no_grad()
+def dev_real_eval(model, mode, datasets, dev):
+    """Mean accuracy (points) over the real replicate tasks of `datasets` (real_data.py npz files), all replicates,
+    1 pass; regression: -100 x mean CRPS (context-sd units), so higher is better and a kill margin of 0.5 = 0.005 CRPS.
+    Used only as a kill switch (--dev_real), never to select a checkpoint."""
+    from real_eval import task_inputs  # (imports this module under its own name; only task_inputs is used)
+    model.eval()
+    accs = []
+    for ds in datasets:
+        for f in sorted(glob.glob(os.path.join(ROOT, 'artifacts', 'real', ds, '*.npz'))):
+            z = _DEV_CACHE.setdefault(f, dict(np.load(f)))
+            tr, te, y = z['train_idx'], z['test_idx'], z['y']
+            order = np.concatenate([tr, te])
+            inp = task_inputs(z, mode, 'all', order, dev)
+            if TASK == 'regression':
+                from reg_metrics import reg_metrics
+                ys = (y - y[tr].mean()) / (y[tr].std() + 1e-8)
+                with amp():
+                    q = model(*inp, torch.tensor(ys[tr], dtype=torch.float32, device=dev)[None])[0].float().cpu().numpy()
+                q = np.sort(q, 1)
+                accs.append(-reg_metrics(q[:, 9::10] if q.shape[1] == 999 else q, ys[te])[0]['crps'])
+                continue
+            n_cls = int(y.max()) + 1
+            with amp():
+                logits = model(*inp, torch.tensor(y[tr], device=dev)[None])
+            accs.append(float((logits[0, :, :n_cls].float().argmax(-1).cpu().numpy() == y[te]).mean()))
+    model.train()
+    torch.cuda.empty_cache()
+    return 100 * float(np.mean(accs))
 
 
 def main():
@@ -403,10 +562,12 @@ def main():
     ap.add_argument('--task', choices=['classification', 'regression'], default='classification')
     ap.add_argument('--regimes', default='', help='json weights over REGIMES (cell,row,col,ctxq); empty = per-cell only')
     ap.add_argument('--k50_prob', type=float, default=0.0, help='share of batches with up to 50 replicates per cell')
-    ap.add_argument('--noise_set', choices=['v1', 'v2', 'v3'], default='v1',
+    ap.add_argument('--noise_set', choices=['v1', 'v2', 'v3', 'v5', 'v6'], default='v1',
                     help='v2 adds the Exp 6 failure / literature modes; v3 adds the contaminated Gaussian (contam)')
     ap.add_argument('--noise_weights', default='', help='json {noise: weight} over the noise set (others weight 1)')
-    ap.add_argument('--scale_max', type=float, default=1.0, help='noise scale ~ logU(0.1, scale_max) x column sd')
+    ap.add_argument('--scale_max', type=float, default=1.0, help='noise scale ~ logU(scale_min, scale_max) x column sd')
+    ap.add_argument('--scale_min', type=float, default=0.1)
+    ap.add_argument('--p6', default='', help='v6: json overrides of P6 (component probabilities), e.g. {"p_tail": 0.2}')
     ap.add_argument('--small_k_prob', type=float, default=0.0, help='share of tables with U{2..5} replicates per cell')
     ap.add_argument('--y_clip', type=float, default=0.0, help='regression: soft-clip standardized targets to +-y_clip in training')
     ap.add_argument('--layouts', default='', help='json weights over LAYOUTS (table,col,group,colgroup), drawn per batch; '
@@ -420,6 +581,11 @@ def main():
     ap.add_argument('--log_every', type=int, default=0, help='also log the running train loss every N steps')
     ap.add_argument('--optim', choices=['adamw', 'muon'], default='adamw', help='muon: backbone with TabICLv2\'s Muon')
     ap.add_argument('--muon_wd', type=float, default=0.0, help='Muon weight decay (tabicl.train default 0)')
+    ap.add_argument('--dev_real', default='', help='comma-separated real dev datasets (e.g. L1000_dose,CellPainting_dose): '
+                    'evaluated at step 0 and every --dev_every steps; KILL SWITCH ONLY (no checkpoint selection)')
+    ap.add_argument('--dev_every', type=int, default=500)
+    ap.add_argument('--dev_kill_margin', type=float, default=0.5, help='stop if dev accuracy < step 0 - margin (points)')
+    ap.add_argument('--dev_kill_until', type=int, default=1000, help='the kill rule applies at dev checks up to this step')
     ap.add_argument('--gate_lr_mult', type=float, default=1.0, help='lr multiplier for the location parameters (per-cell '
                     'gate rep_gate, location scores rep_enc.loc_head): both start at zero and gate each other\'s gradient')
     ap.add_argument('--precision', choices=['bf16', 'fp32'], default=None,
@@ -427,7 +593,7 @@ def main():
                          'TabICLv2 2-4 accuracy points (e.g. clean 0.742 -> 0.720)')
     args = ap.parse_args()
     dev = 'cuda'
-    global TASK, TRAIN_NOISES, ARCH, VAL_BLOCKS, VAL_NOISES, PRECISION
+    global TASK, TRAIN_NOISES, ARCH, VAL_BLOCKS, VAL_NOISES, PRECISION, NOISE_SET
     TASK, ARCH = args.task, args.arch
     PRECISION = args.precision or ('fp32' if ARCH == 'tabicl' else 'bf16')
     if PRECISION == 'fp32':  # TF32 tensor-core matmuls, as tabicl.train sets (10-bit mantissa vs bf16's 7)
@@ -437,7 +603,8 @@ def main():
     VAL_NOISES = args.val_noises.split(',') if args.val_noises else None
     if ARCH == 'tabicl' and TASK == 'regression':
         set_quantiles(load_tabicl('regression')[0]['out_dim'])
-    TRAIN_NOISES = {'v1': NOISES, 'v2': NOISES_V2, 'v3': NOISES_V3}[args.noise_set]
+    NOISE_SET = args.noise_set
+    TRAIN_NOISES = {'v1': NOISES, 'v2': NOISES_V2, 'v3': NOISES_V3, 'v5': NOISES_V5, 'v6': list(V6_SETTINGS)}[args.noise_set]
     regimes = json.loads(args.regimes) if args.regimes else None
     layouts = (lambda w: np.asarray(w) / np.sum(w))(json.loads(args.layouts)) if args.layouts else None
     use_aux = args.aux_w > 0
@@ -456,9 +623,13 @@ def main():
     for k, v in rep_cfg.pop('_args', {}).items():  # training-argument overrides carried in the branch config (screens)
         assert hasattr(args, k), k
         setattr(args, k, v)
-    global NOISE_W, SCALE_MAX, SMALL_K_PROB
-    SCALE_MAX, SMALL_K_PROB = args.scale_max, args.small_k_prob
-    TRAIN_NOISES = {'v1': NOISES, 'v2': NOISES_V2, 'v3': NOISES_V3}[args.noise_set]  # (after the overrides)
+    global NOISE_W, SCALE_MAX, SCALE_MIN, SMALL_K_PROB
+    SCALE_MAX, SCALE_MIN, SMALL_K_PROB = args.scale_max, args.scale_min, args.small_k_prob
+    NOISE_SET = args.noise_set
+    TRAIN_NOISES = {'v1': NOISES, 'v2': NOISES_V2, 'v3': NOISES_V3, 'v5': NOISES_V5, 'v6': list(V6_SETTINGS)}[args.noise_set]  # (after the overrides)
+    if args.p6:  # training draws only: validation settings are defined relative to the default P6 (V6_SETTINGS)
+        P6_TRAIN.update(json.loads(args.p6) if isinstance(args.p6, str) else args.p6)
+        assert set(P6_TRAIN) == set(P6), args.p6
     if args.noise_weights:
         w = json.loads(args.noise_weights) if isinstance(args.noise_weights, str) else args.noise_weights
         assert set(w) <= set(TRAIN_NOISES), w
@@ -514,6 +685,15 @@ def main():
         if step % args.val_every == 0 or step == args.steps:
             v = validate(model, args.mode, bank, dev)
             rec = dict(step=step, time=time.time() - t0, train_loss=float(np.mean(run_loss)) if run_loss else None, val=v)
+            kill = False
+            if args.dev_real and step % args.dev_every == 0:
+                rec['dev_real'] = dev_real_eval(model, args.mode, args.dev_real.split(','), dev)
+                prev = [json.loads(l) for l in open(os.path.join(out_dir, 'log.jsonl'))] if os.path.exists(os.path.join(out_dir, 'log.jsonl')) else []
+                base0 = next((r['dev_real'] for r in prev if r.get('step') == 0 and 'dev_real' in r), rec['dev_real'] if step == 0 else None)
+                if base0 is not None and 0 < step <= args.dev_kill_until and rec['dev_real'] < base0 - args.dev_kill_margin:
+                    kill = True
+                    rec['dev_kill'] = f"dev {rec['dev_real']:.2f} < step-0 {base0:.2f} - {args.dev_kill_margin}"
+                print(f"dev_real step {step}: {rec['dev_real']:.2f} (step 0: {base0})" + ('  -> KILL' if kill else ''), flush=True)
             log.write(json.dumps(rec) + '\n'); log.flush()
             print(f"step {step:6d} {rec['time']:6.0f}s train {rec['train_loss'] or float('nan'):.4f} | " +
                   ' '.join(f"{k} {x['acc']:.3f}/{x['loss']:.3f}" for k, x in v.items()), flush=True)
@@ -523,6 +703,9 @@ def main():
                             np_rng=rng.bit_generator.state, torch_rng=g.get_state()), last + '.tmp')
             os.replace(last + '.tmp', last)
             if args.stop_at and step == args.stop_at:
+                return
+            if kill:
+                print('stopped by the dev kill switch', flush=True)
                 return
         if step == args.steps:
             break

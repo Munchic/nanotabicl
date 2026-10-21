@@ -221,6 +221,230 @@ def build_tox21(max_rows=1000):
     json.dump(dict(dataset='Tox21', role='held-out test', tasks=tasks), open(os.path.join(out_dir, 'manifest.json'), 'w'), indent=1)
 
 
+# ----- regression tasks (Exp 11; designs fixed before any model was evaluated on them) -----
+# y float64 = the target; everything else as the classification tasks. real_eval_reg.py evaluates them.
+GAS_CONC = os.path.join(ROOT, 'artifacts', 'real_raw', 'gas_drift_conc', 'raw')  # UCI 270: '<gas>;<ppmv>' labels
+
+
+def build_gas_reg(max_rows=1000):
+    """GasConc: Gas sensor array drift at different concentrations (Vergara et al. 2012, UCI 270). One task per gas
+    (6): target log10 concentration [ppmv]; rows = measurements of that gas from all 10 batches; columns / replicates as
+    build_gas (4 physical units per sensor type). Seeded half / half split, <= max_rows per side. Held-out test set."""
+    from sklearn.datasets import load_svmlight_file
+    X_all, gas, conc = [], [], []
+    for b in range(1, 11):
+        lines = open(os.path.join(GAS_CONC, f'batch{b}.dat')).read().splitlines()
+        lab = [l.split(' ', 1)[0].split(';') for l in lines]
+        import io
+        X, _ = load_svmlight_file(io.BytesIO('\n'.join('0 ' + l.split(' ', 1)[1] for l in lines).encode()), n_features=128)
+        X_all.append(X.toarray()); gas += [int(g) for g, _ in lab]; conc += [float(c) for _, c in lab]
+    X_all, gas, conc = np.concatenate(X_all), np.array(gas), np.array(conc)
+    out_dir = os.path.join(OUT, 'GasConc')
+    os.makedirs(out_dir, exist_ok=True)
+    tasks = []
+    for g_ in sorted(set(gas.tolist())):
+        idx = np.where((gas == g_) & (conc > 0))[0]
+        rng = np.random.default_rng([g_, 17])
+        idx = rng.permutation(idx)
+        half = len(idx) // 2
+        tr, te = idx[:half][:max_rows], idx[half:][:max_rows]
+        rows = np.concatenate([tr, te])
+        S = X_all[rows].reshape(len(rows), 16, 8)
+        reps = np.stack([S[:, units, :] for units in GAS_TYPES], axis=1).transpose(0, 1, 3, 2).reshape(len(rows), 32, 4)
+        full = np.full((len(rows), 32, K_MAX), np.nan, dtype=np.float32)
+        full[..., :4] = reps
+        y = np.log10(conc[rows])
+        name = f'gas{g_}'
+        np.savez_compressed(os.path.join(out_dir, name + '.npz'), replicates=full, counts=np.full((len(rows), 32), 4, np.int8),
+                            y=y, train_idx=np.arange(len(tr)), test_idx=np.arange(len(tr), len(rows)),
+                            group=np.arange(len(rows)).astype(str), meta=json.dumps(dict(dataset='GasConc', task=name, target='log10 ppmv')))
+        tasks.append(dict(task=name, n_train=int(len(tr)), n_test=int(len(te)), y_sd=float(y.std())))
+        print('GasConc', name, f'context {len(tr)}, test {len(te)}, log10 conc sd {y.std():.2f}', flush=True)
+    json.dump(dict(dataset='GasConc', role='held-out test', tasks=tasks), open(os.path.join(out_dir, 'manifest.json'), 'w'), indent=1)
+
+
+def build_tox21_reg(max_rows=1000, min_rows=100):
+    """Tox21Pot: potency regression. Per target assay (12): rows = substances with a fitted AC50 in the majority of
+    their runs of the target; y = median log10 AC50 [uM] over those fitted runs (uncensored target; censored targets are
+    CENSORING.md's track). Features / replicates as build_tox21 (the other 11 assays' per-run log AC50, censored at the
+    top concentration, and efficacy). Seeded half / half, <= max_rows per side; assays with < min_rows rows skipped."""
+    runs = {}
+    for a in TOX_ASSAYS:
+        d = pd.read_csv(os.path.join(TOX, f'tox21-{a}', f'tox21-{a}.txt'), sep='\t', index_col=False, low_memory=False)
+        d = d[d['SAMPLE_DATA_TYPE'].astype(str).str.match(r'^(set\d|ratio(_\d)?|antagonist\d|agonist)$')]
+        conc = d[[c for c in d.columns if c.startswith('CONC')]].to_numpy(np.float64)
+        ac50 = d['AC50'].to_numpy(np.float64)
+        logac = np.log10(np.where(np.isfinite(ac50), ac50, np.nanmax(conc, 1) * 1e6))
+        eff = np.where(np.isfinite(ac50), d['EFFICACY'].to_numpy(np.float64), 0.0)
+        runs[a] = pd.DataFrame({'id': d['TOX21_ID'].to_numpy(), 'logac': logac, 'eff': np.nan_to_num(eff),
+                                'fit': np.isfinite(ac50)})
+    ids = sorted(set.intersection(*[set(r['id']) for r in runs.values()]))
+    pos = {i: j for j, i in enumerate(ids)}
+    n = len(ids)
+    out_dir = os.path.join(OUT, 'Tox21Pot')
+    os.makedirs(out_dir, exist_ok=True)
+    tasks = []
+    for t, target in enumerate(TOX_ASSAYS):
+        feats = [a for a in TOX_ASSAYS if a != target]
+        reps = np.full((n, 2 * len(feats), K_MAX), np.nan, dtype=np.float32)
+        cnt = np.zeros((n, 2 * len(feats)), dtype=np.int8)
+        for j, a in enumerate(feats):
+            r = runs[a][runs[a]['id'].isin(pos)]
+            for col, v in ((2 * j, 'logac'), (2 * j + 1, 'eff')):
+                for i, val in zip(r['id'].map(pos), r[v]):
+                    k = cnt[i, col]
+                    if k < K_MAX:
+                        reps[i, col, k] = val
+                        cnt[i, col] = k + 1
+        rt = runs[target][runs[target]['id'].isin(pos)]
+        g = rt.groupby('id').agg(share=('fit', 'mean'))
+        med = rt[rt['fit']].groupby('id')['logac'].median()
+        y = np.full(n, np.nan)
+        for i_, row in g.iterrows():
+            if row['share'] > 0.5:
+                y[pos[i_]] = med[i_]
+        ok = np.where(np.isfinite(y) & (cnt.min(1) > 0))[0]
+        name = f'target_{t + 1:02d}'
+        if len(ok) < min_rows:
+            print('Tox21Pot', name, target, f'{len(ok)} rows < {min_rows}: skipped', flush=True)
+            continue
+        rng = np.random.default_rng([t, 19])
+        idx = rng.permutation(ok)
+        half = len(idx) // 2
+        tr, te = idx[:half][:max_rows], idx[half:][:max_rows]
+        rows = np.concatenate([tr, te])
+        np.savez_compressed(os.path.join(out_dir, name + '.npz'), replicates=reps[rows], counts=cnt[rows], y=y[rows],
+                            train_idx=np.arange(len(tr)), test_idx=np.arange(len(tr), len(rows)), group=np.array(ids)[rows],
+                            meta=json.dumps(dict(dataset='Tox21Pot', task=name, target=target, features=feats)))
+        tasks.append(dict(task=name, target=target, n_train=int(len(tr)), n_test=int(len(te)), y_sd=float(y[rows].std())))
+        print('Tox21Pot', name, target, f'context {len(tr)}, test {len(te)}, log AC50 sd {y[rows].std():.2f}', flush=True)
+    json.dump(dict(dataset='Tox21Pot', role='held-out test', tasks=tasks), open(os.path.join(out_dir, 'manifest.json'), 'w'), indent=1)
+
+
+def build_lincs_dose_reg(which):
+    """<which>_dose_reg (dev): the <which>_dose tasks with target = the row's dose level (1-6, log-spaced doses);
+    same rows, replicates and split (every compound in the context, a third of its doses held out)."""
+    out_dir = os.path.join(OUT, f'{which}_dose_reg')
+    os.makedirs(out_dir, exist_ok=True)
+    for f in sorted(os.listdir(os.path.join(OUT, f'{which}_dose'))):
+        if not f.endswith('.npz'):
+            continue
+        z = dict(np.load(os.path.join(OUT, f'{which}_dose', f)))
+        z['y'] = np.array([float(g.split('|')[1]) for g in z['group']])
+        z['meta'] = json.dumps(dict(dataset=f'{which}_dose_reg', task=f[:-4], target='dose level'))
+        np.savez_compressed(os.path.join(out_dir, f), **z)
+        print(f'{which}_dose_reg', f[:-4], f"rows {len(z['y'])}, dose levels {sorted(set(z['y'].tolist()))}", flush=True)
+
+
+UPS = os.path.join(ROOT, 'artifacts', 'real_raw', 'proteomics_PXD002099', 'YEAST-Data-NonNormalized.csv')
+
+
+def build_ups1(n_splits=10, keep_fmol=None, name='UPS1'):
+    """Proteomics spike-in benchmark (PXD002099, Pursiheimo et al. 2015): UPS1 standard proteins spiked into a yeast
+    background at 2 / 4 / 10 / 25 / 50 fmol, 3 replicate LC-MS runs each; label-free protein intensities.
+    Rows = proteins; columns = the 5 concentrations; replicates = the 3 runs of each concentration (not paired across
+    columns). Values: log2 intensity minus the protein's median over the included runs (its profile across concentrations).
+    UPS1_low keeps only 2 and 4 fmol (a 2-fold change at about the replicate noise level, where replicates matter).
+    Missing intensities are real non-detects (intensity-dependent): a cell with no detected run gets one value at the
+    column's 1st percentile (detection-floor substitution, i.e. left-censoring). Label: UPS1 spike-in (changes with the
+    concentration) vs yeast background (constant): differential-abundance detection with ground truth. 10 seeded
+    stratified 50 / 50 context / test splits. Held-out test set."""
+    d = pd.read_csv(UPS, sep=';', decimal=',')
+    fmol = lambda c: int(c.split('fmol')[0].split('_')[-1])
+    runs = [c for c in d.columns if 'fmol' in c and (keep_fmol is None or fmol(c) in keep_fmol)]
+    conc = sorted({fmol(c) for c in runs})
+    X = np.log2(d[runs].to_numpy(np.float64))
+    with np.errstate(all='ignore'):
+        X = X - np.nanmedian(X, 1, keepdims=True)  # centered on the INCLUDED runs only (no leak from other concentrations)
+    y = d['Accession'].astype(str).str.contains('ups').to_numpy().astype(np.int64)
+    n = len(d)
+    reps = np.full((n, len(conc), K_MAX), np.nan, dtype=np.float32)
+    cnt = np.zeros((n, len(conc)), dtype=np.int8)
+    for j, c in enumerate(conc):
+        cols = [i for i, r in enumerate(runs) if fmol(r) == c]
+        V = X[:, cols]
+        floor = np.nanquantile(V, 0.01)
+        for i in range(n):
+            v = V[i][np.isfinite(V[i])]
+            if len(v) == 0:
+                v = np.array([floor])  # non-detect in every run: detection-floor substitution
+            reps[i, j, :len(v)] = v
+            cnt[i, j] = len(v)
+    out_dir = os.path.join(OUT, name)
+    os.makedirs(out_dir, exist_ok=True)
+    for t in range(n_splits):
+        rng = np.random.default_rng([t, 17])
+        tr, te = [], []
+        for c in (0, 1):
+            idx = rng.permutation(np.where(y == c)[0])
+            tr.append(idx[:len(idx) // 2]); te.append(idx[len(idx) // 2:])
+        tr, te = np.concatenate(tr), np.concatenate(te)
+        rows = np.concatenate([tr, te])
+        np.savez_compressed(os.path.join(out_dir, f'split{t + 1:02d}.npz'), replicates=reps[rows], counts=cnt[rows], y=y[rows],
+                            train_idx=np.arange(len(tr)), test_idx=np.arange(len(tr), len(rows)),
+                            group=d['Accession'].to_numpy().astype(str)[rows],
+                            meta=json.dumps(dict(dataset=name, concentrations_fmol=conc, runs_per_cell=3)))
+    print(name, f'proteins {n} (UPS1 {y.sum()}), cells with all runs missing {(np.isnan(X).reshape(n, len(conc), -1).all(-1)).mean():.3f}, '
+          f'missing runs {np.isnan(X).mean():.3f}', flush=True)
+    json.dump(dict(dataset=name, role='held-out test', n=int(n), n_ups=int(y.sum()), concentrations=conc, n_splits=n_splits),
+              open(os.path.join(out_dir, 'manifest.json'), 'w'), indent=1)
+
+
+CPTAC = os.path.join(ROOT, 'artifacts', 'real_raw', 'proteomics_cptac', 'peptides.txt')
+
+
+def build_cptac(n_splits=10, max_rows=1000):
+    """CPTAC study 6 spike-in (MaxQuant peptides.txt, lab 3, as distributed by statOmics / msqrob2): UPS1 proteins
+    spiked into yeast at two levels (conditions 6A / 6B), 3 technical replicate runs each. Rows = peptides (reverse /
+    contaminant hits removed); columns = the two conditions; replicates = the 3 runs. Values: log2 intensity minus the
+    peptide's median over its detected runs. Missing intensities are real, intensity-dependent non-detects (82% for the
+    low-abundance UPS1 peptides, 43% for yeast): a condition with no detected run gets one value at the detection floor
+    (the run's 1st percentile, relative to the peptide's median); the `censored` mask marks those cells (for censoring
+    flags). Label: UPS1 spike-in vs yeast. 10 seeded stratified splits of <= max_rows context / test. Held-out test set."""
+    d = pd.read_csv(CPTAC, sep='\t', low_memory=False)
+    d = d[(d.get('Reverse', '') != '+') & (d.get('Potential contaminant', '') != '+')].reset_index(drop=True)
+    runs = [c for c in d.columns if c.startswith('Intensity ') and c[-3] in 'AB']
+    V = np.log2(d[runs].replace(0, np.nan).to_numpy(np.float64))
+    seen = np.isfinite(V).any(1)  # peptides detected in at least one of these runs
+    d, V = d[seen].reset_index(drop=True), V[seen]
+    floor = np.nanquantile(V, 0.01, axis=0)  # per-run detection floor (log2)
+    med = np.nanmedian(V, 1, keepdims=True)
+    y = d['Proteins'].astype(str).str.contains('ups', case=False).to_numpy().astype(np.int64)
+    n = len(d)
+    conds = sorted({r[-3] for r in runs})
+    reps = np.full((n, len(conds), K_MAX), np.nan, dtype=np.float32)
+    cnt = np.zeros((n, len(conds)), dtype=np.int8)
+    cens = np.zeros((n, len(conds)), dtype=bool)
+    for j, cnd in enumerate(conds):
+        cols = [i for i, r in enumerate(runs) if r[-3] == cnd]
+        for i in range(n):
+            v = V[i, cols]
+            v = v[np.isfinite(v)] - med[i, 0]
+            if len(v) == 0:  # not detected in any run of this condition: detection floor
+                v = np.array([np.mean(floor[cols]) - med[i, 0]])
+                cens[i, j] = True
+            reps[i, j, :len(v)] = v
+            cnt[i, j] = len(v)
+    out_dir = os.path.join(OUT, 'CPTAC')
+    os.makedirs(out_dir, exist_ok=True)
+    for t in range(n_splits):
+        rng = np.random.default_rng([t, 19])
+        tr, te = [], []
+        for c in (0, 1):
+            idx = rng.permutation(np.where(y == c)[0])
+            half = len(idx) // 2
+            k = int(round(max_rows * (y == c).mean()))  # keep the natural class rate in each side
+            tr.append(idx[:half][:k]); te.append(idx[half:][:k])
+        tr, te = np.concatenate(tr), np.concatenate(te)
+        rows = np.concatenate([tr, te])
+        np.savez_compressed(os.path.join(out_dir, f'split{t + 1:02d}.npz'), replicates=reps[rows], counts=cnt[rows], y=y[rows],
+                            censored=cens[rows], train_idx=np.arange(len(tr)), test_idx=np.arange(len(tr), len(rows)),
+                            group=d['Sequence'].to_numpy().astype(str)[rows], meta=json.dumps(dict(dataset='CPTAC', conditions=conds)))
+    print('CPTAC', f'peptides {n} (UPS1 {y.sum()}), censored cells {cens.mean():.3f} (UPS1 {cens[y == 1].mean():.3f})', flush=True)
+    json.dump(dict(dataset='CPTAC', role='held-out test', n=int(n), n_ups=int(y.sum()), n_splits=n_splits),
+              open(os.path.join(out_dir, 'manifest.json'), 'w'), indent=1)
+
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--datasets', default='L1000,CellPainting')
@@ -232,7 +456,19 @@ if __name__ == '__main__':
     for ds in a.datasets.split(','):
         if ds == 'GasDrift':
             build_gas()
+        elif ds == 'GasConc':
+            build_gas_reg()
+        elif ds == 'Tox21Pot':
+            build_tox21_reg()
+        elif ds.endswith('_dose_reg'):
+            build_lincs_dose_reg(ds[:-len('_dose_reg')])
         elif ds == 'Tox21':
             build_tox21()
+        elif ds == 'UPS1':
+            build_ups1()
+        elif ds == 'CPTAC':
+            build_cptac()
+        elif ds == 'UPS1_low':  # 2 vs 4 fmol: a 2-fold change at about the replicate noise level (low SNR)
+            build_ups1(keep_fmol=(2, 4), name='UPS1_low')
         else:
             build(ds, a.n_components, a.n_tasks, a.split)

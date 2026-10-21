@@ -33,4 +33,7 @@ def huber_impute(R, M, ctx_rows, iters=10):
             w = np.minimum(1.0, C_HUBER * sig[None, :, None] / np.maximum(np.abs(r), 1e-12))
             w = np.where(M, w, 0.0)
             mu = np.where(np.isfinite(sig)[None], np.nansum(w * np.nan_to_num(X), -1) / np.maximum(w.sum(-1), 1e-12), np.nanmean(X, -1))
+        # degenerate column scale (e.g. many exactly tied values, as Tox21's efficacy 0 for inactive runs): sigma -> 0
+        # is the median limit of the Huber estimate (without this all weights vanish and the estimate collapses to 0)
+        mu = np.where((np.isfinite(sig) & (sig <= 1e-12))[None], np.nanmedian(X, -1), mu)
     return mu

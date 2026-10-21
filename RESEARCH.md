@@ -1730,3 +1730,296 @@ Center position between the cell median (0) and the cell mean (1), median over r
   - Both gates get gradient at step 0 (0.17 / 2.6).
 - **Matched baseline:** imputation mode `huber` (`obs_train` / `obs_eval` / `real_eval`).
 - **Runs ([lane7.sh](experiments/obs_noise/lane7.sh)):** `tx_huber0p` (reference) and `tx_v4huber_A` (v4 prior, 3000 steps).
+
+**Caveat: the v4 runs' validation curves are confounded.** `--small_k_prob` also applied inside validation, so `tx_v4med_A`, `tx_v4mean_A` and `tx_v4huber_A` validated on different tables (half with U{2..5} replicates) than their step-0 references; `tx_v4huber_A` therefore shows −0.45 at step 0 instead of 0. Their 27-dataset and real-data evaluations use stored data and are not affected. **Fixed:** small-K tables are now drawn only in training batches (`regimes is not None`); runs started later validate on the fixed design.
+
+**TabICLv2 + Huber imputation (`tx_huber0p`, no training):**
+- **LINCS dose (dev):** 0.664, **+1.0 ± 0.5 vs wrapper + mean (6/10)**, the best real-data result so far; compound split 0.164 / 0.233 (L1000 / Cell Painting).
+- **27 synthetic datasets:** main 0.640 vs 0.645 for median imputation. Heavy censoring is −5.7 (0.572 vs 0.629), because ties at the detection limit pull Huber down; the rest is about even.
+
+**Huber-start result (`tx_v4huber_A`, v4 prior, 3000 steps), and what training does on real data.**
+
+LINCS dose split (dev):
+
+| | accuracy | Δ |
+|---|---|---|
+| TabICLv2 + Huber imputation (no training) | **0.664** | +1.0 vs wrapper + mean |
+| Huber start, trained | 0.652 | **−1.2 ± 0.5 vs its own start (0/10)** |
+| trained, learned center only (embedding maps and temperature head zeroed) | 0.646 | −1.8 |
+| trained, embeddings only (center forced back to Huber) | 0.656 | −0.8 |
+
+- Synthetic main settings: +0.8 vs the wrapper, like the other v4 runs.
+- **Wherever the branch starts, synthetic training lands it at about 0.64–0.65 on LINCS:**
+  - median start 0.576 → 0.624–0.641 (training helps);
+  - mean start 0.654 → 0.642 (hurts);
+  - Huber start 0.664 → 0.652 (hurts).
+- Both learned parts move away from what works on LINCS, the center most. The synthetic gains sit in modes LINCS does not have (censoring +6.9, failures +3.8 over Huber on validation).
+
+**Bug found on a held-out set: degenerate Huber scale.**
+- On Tox21, Huber imputation first scored AUC 0.827 (−7.2 vs median imputation, 0/12). Efficacy is exactly 0 for inactive runs, so the pooled residual scale was 0; all IRLS weights vanished and the estimate collapsed to 0.
+- **Fix** (numpy and torch, still equal to 9e-16): σ ≤ 1e-12 falls back to the cell median, the σ → 0 limit of the Huber estimate. A correctness fix for degenerate input, not tuned on Tox21.
+- After the fix: Tox21 0.901, **+0.2 ± 0.1 (8/12)**; LINCS unchanged (no ties there).
+- **`tx_v4huber_A` was trained with the buggy estimator.** The prior has point-mass columns, so its starting center collapsed in some batches; its results are partly confounded.
+
+**Real-data scoreboard** (Δ vs the wrapper with median imputation, 1 est.; held-out sets untouched by any design choice except the bug fix above):
+
+| | LINCS dose (dev), acc | Gas drift (test), acc | Tox21 (test), AUC |
+|---|---|---|---|
+| wrapper + mean | +7.6 | −0.4 | 0.0 |
+| **TabICLv2 + Huber imputation (fixed estimator)** | **+8.7** | 0.0 | **+0.2 ± 0.1** |
+| stage A, per-cell gate (v2) | +4.7 | **+1.7 ± 0.6 (1 pass)** | +0.1 |
+| stage B (v2) | +6.3 | 0.0 | +0.2 |
+| Huber start, trained (v4, buggy) | +7.5 | −0.4 | +0.1 |
+
+- **The one transferable win is the estimator, not the learned branch.**
+- Huber imputation with a column-pooled scale is best or tied on all three real datasets, and it costs nothing to apply.
+- The synthetic-trained branch gives large synthetic gains (classification stage B +2.0 points, regression −0.032 CRPS vs the wrapper) but no consistent real-data gain.
+- The gas-drift stage A lead (+1.7) disappears with 8 passes (see above).
+
+**Change of direction (user, 2026-10-20): less hand-built bias in the model; invest in the prior and in user-supplied side information.**
+- The Huber start, the per-cell gates and the column-statistics gate inputs were all hand-designed fixes for specific failure cases. They were dropped from the main line. The code stays, as options, for reference.
+- **`tx_v5gen_A` (running, [lane9.sh](experiments/obs_noise/lane9.sh)):** the v5 prior with a generic branch, i.e. the plain learned center (`attn`: attention over the replicates, starting at the mean), with no Huber start and no gates. It tests whether the prior alone can teach adaptivity. LINCS dev is a kill switch only.
+- **Next:**
+  1. **A broad, continuous synthetic prior instead of a list of named modes.** Draw each column's (and row group's) noise from continuous families: tail index ν ~ logU(1, 50) (Gaussian → Cauchy), contamination rate and width, row and value heteroscedasticity strength, additive vs multiplicative (constant CV) mix, plate / well offsets shared across columns with random strength, left / right censoring with random limits, detection dropout, replicate-count design (mostly 2–5, sometimes up to 50). Fresh draws and a longer schedule.
+  2. **User-specified side information as optional inputs** (with the other agent's censoring spec channels, `cens_model.py`): per-replicate flags (below LOD / above ULOQ / observed), and possibly a "replicates are paired across features" flag. In training the prior shows the flags with some probability, so the model learns both with and without them. Without flags the input equals the generic model.
+  3. **Evaluation unchanged:** LINCS dev as a kill switch; gas drift and Tox21 held out until the end. Tox21 has natural censoring (inactive = above the top concentration), so it doubles as a real test of the censoring flags.
+
+**Replicates as rows (LINCS dose split, dev; wrapper, 1 est.; no training).** Context = every well of every context row (label repeated); each test well predicted separately, probabilities averaged over the row's wells.
+
+| | acc | L1000 | Cell Painting | log-loss | vs mean imputation |
+|---|---|---|---|---|---|
+| mean imputation (baseline) | 0.653 | 0.503 | 0.803 | **1.014** | |
+| **wells as context rows, test wells averaged** | 0.648 | **0.467** | **0.829** | 1.181 | −0.5 ± 1.6 (5/10) |
+| wells as context rows, mean-imputed test rows | 0.570 | 0.439 | 0.702 | 1.247 | −8.3 |
+| mean-imputed context, test wells averaged | 0.548 | 0.425 | 0.671 | 1.414 | −10.5 |
+
+- **The instance-level view has signal the per-cell summaries discard:** Cell Painting +2.6 (+9 on moa05: 0.898 vs 0.806).
+- It **hurts the noisier L1000** (−3.6) and is **overconfident** (log-loss +0.17): the in-context learner treats a row's wells as independent examples.
+- **Context and test representations must match** (the hybrids lose 8–10 points).
+- **Implication:** a group-aware instance-level model (paired replicates; wells as tokens that know their row; learned pooling of evidence) is the first concrete source of real-data headroom beyond mean / Huber imputation.
+
+**Revised priorities (2026-10-20):**
+1. **Paired / instance-level replicate modeling,** promoted. Novel, matches how LINCS-like data is produced, and the only lever with demonstrated real-data headroom.
+2. **A real replicate benchmark where replicate handling can matter,** with datasets chosen before looking at any model result.
+   - Current sets: LINCS is near-Gaussian (mean ≈ optimal for location); gas drift and Tox21 have low replicate noise (1 → all replicates: +3 accuracy / +1.3 AUC points, vs +11 on LINCS).
+   - The synthetic gains sit in censoring, non-detect and outlier modes these datasets lack. Candidates: qPCR with non-detects, label-free proteomics with intensity-dependent missingness, immunoassays with LOD / ULOQ, imaging screens with failed wells.
+   - Screening criterion: a large 1 → all-replicate gain (headroom) and a known measurement process.
+3. **A continuous synthetic prior,** including paired tables (well effects, within-group variability) and fresh draws.
+4. **Stage A only; capacity by default,** with a base-size control in the first run.
+
+**Training-free group-normalized attention (LINCS dose split, dev; TabICLv2, 1 est.; [model.py](model.py) `key_bias`).**
+- **Mechanism.** `key_bias` (B, rows) is added to the attention logits wherever context rows are keys (column-stage inducing attention, ICL). The default is None = unchanged.
+- **Group normalization.** Wells as context rows with bias −log(n_wells of the unit), so each unit carries total weight 1 in every attention over rows.
+- **Exactness check.** With non-uniform duplication (10 rows ×3, bias −log 3) the output equals the original to 2e-5 when preprocessing is the identity. With the TabICL preprocessing the residual is 0.39, because the z-score / clip statistics count wells. Scratch scripts: `groupnorm_lincs.py`, `groupnorm_ablate.py`.
+
+| test wells averaged per unit | L1000 | Cell Painting | avg |
+|---|---|---|---|
+| mean imputation (reference) | 50.6 | 80.3 | 65.4 |
+| Huber imputation | 50.6 | 82.1 | **66.4** |
+| wells as rows, no bias | 47.1 | **82.8** | 65.0 |
+| + group bias, SSMax count = number of units | 36.1 | 53.9 | 45.0 |
+| + group bias, SSMax count = real key count | 47.0 | 82.6 | 64.8 |
+| + group bias in the column stage only | 45.1 | 81.6 | 63.4 |
+| + group bias in ICL only, real SSMax count | 46.6 | 83.0 | 64.8 |
+
+- **Group normalization is neutral (−0.2) once SSMax keeps the real key count.**
+- The −20 came from SSMax: telling it there are fewer keys flattens attention over the ~3k real keys. `model.py` now always passes the real count.
+- Reweighting units does not cure the L1000 loss or the overconfidence of wells-as-rows. The model's problem is treating wells as independent examples in its *predictions*, not their attention weight.
+- **No training-free route beats Huber imputation on LINCS.** Instance-level gains need training, with paired replicate tables in the prior.
+
+**`tx_v5gen_A` result** (v5 prior, generic branch: plain learned center, no Huber start, no gates; frozen backbone; 4000 steps; [lane9.sh](experiments/obs_noise/lane9.sh)).
+- **LINCS dev.** Never degraded: steps 0 → 4000 went 65.4 → 66.0 / 65.5 / 64.9 / 66.0 / 65.8 / 65.6 / 65.7 / 65.9. The kill switch passed.
+  - Final: L1000 50.2, Cell Painting 81.7, average **65.9**, vs mean imputation 65.4 and **Huber imputation 66.4**.
+- **Synthetic, 27 datasets, 1 pass, vs the wrapper (1 est.):** main **+0.8 ± 0.2** (22/27), het 0.0, log-loss 0.828 (wrapper 0.846).
+  - For comparison: stage B (v2) +1.9 (25/27), and Huber imputation −0.5 (it loses on the heavy censoring / failure modes).
+
+| | synthetic main vs wrapper | LINCS dev |
+|---|---|---|
+| wrapper (median, 1 est.) | 0 | 57.6 (mean imputation: 65.4) |
+| Huber imputation | −0.5 | **66.4** |
+| `tx_v5gen_A` (generic, v5) | +0.8 | 65.9 |
+| stage B (v2) | **+1.9** | 64.0 |
+
+- **The generic branch no longer drifts away from real data:** a real-shaped prior stopped the LINCS degradation the v2/v4 branches showed.
+- It is not yet better than a good fixed estimator on near-Gaussian real data.
+- Its synthetic gain is less than half of stage B's, because the v5 prior gives the hard modes low weight.
+- **Next:** the continuous prior (value-dependent missingness, intensity-dependent CV, paired well effects, realistic non-detect substitution, broad replicate-count designs) with the censoring flags; larger branch with a base-size control; the same kill switch.
+
+**Matched ensembles (8 passes everywhere; LINCS dose dev).** Our checkpoints: 8 passes of column permutation + class shift. The wrapper: its own 8 estimators.
+
+| | 1 pass / est. | 8 passes / est. |
+|---|---|---|
+| wrapper, mean-imputed input | 65.3 | 65.7 |
+| wrapper, median-imputed input | 57.7 | 57.6 |
+| our pipeline, mean imputation | 65.4 | 65.6 |
+| Huber imputation | **66.4** | 66.1 |
+| `tx_v5gen_A` | 65.9 | **66.2** |
+| stage B (v2) | 64.0 | 64.2 |
+
+- Synthetic, 27 sets: `tx_v5gen_A` 8 passes is +1.0 ± 0.2 vs the wrapper at 1 est. The wrapper's own 8 est. adds only +0.1, so the matched gap is about +0.9. Stage B at 8 passes: +2.0.
+- **Rule from now on:** report both. The headline is 8 vs 8 against the off-the-shelf wrapper with mean-imputed input (what a user would feed it).
+
+## Exp 10 — Continuous replicate prior (v6) + user side information (2026-10-20, running)
+
+**Prior** (`observe_v6` in [obs_train.py](experiments/obs_noise/obs_train.py), `--noise_set v6`). No named noise models: every table draws its own observation process, and the components combine freely. P6 gives the probability that a table has each component; each strength is continuous.
+
+| component | P(table) | draw |
+|---|---|---|
+| noise scale | always | logU(0.05, 2) × column sd; columns spread exp(U(0,1)·N) (p 0.7) |
+| tails | 0.5 | eps = N / \|N'\|^a, a ∈ [0, 1] (Gaussian → Cauchy), per-column jitter |
+| contamination | 0.35 | share U(0, 0.1) of replicates, logU(3, 30) wider, symmetric or one-sided (0.3) |
+| row heteroscedasticity | 0.4 | exp(U(0, 0.8)·N) per row |
+| value-dependent noise | 0.35 | exp(β·z(x)), β ~ U(−0.8, 0.8): intensity-dependent CV either way |
+| paired well effect | 0.4 | N(0, ω²σ²) per (row, replicate k), shared by all columns (loadings U(0.3, 1.5)) |
+| run / plate effect | 0.3 | per (column, k) + common per k, U(0, 0.8)·σ |
+| failed wells | 0.2 | share U(0, 0.15); floor / large shift / lost; whole well (all columns) w.p. 0.5 |
+| missing at random | 0.3 | replicates lost w.p. U(0, 0.3) |
+| lower detection limit | 0.35 | column quantile U(0.02, 0.6); soft or sharp sigmoid on the measured value; undetected → absent (MNAR: informative counts, n = 0 cells) / at the limit (flagged '<' with the spec) / substituted floor (never flagged) |
+| upper limit | 0.12 | quantile U(0.8, 0.99), reported at the limit, flagged '>' |
+| spec shown | 0.5 | flags kept; otherwise all 0 |
+| exact columns / tables | 0.3 / p_clean | covariates: n = 1, no noise |
+| replicate design | always | n = 1 / 2 / 3 / 4 / 5 / U{6..K} per table / U{1..K} per cell = 5 / 20 / 30 / 15 / 10 / 10 / 10%; row variation (0.3); test rows n = 1 (0.1); K = 50 in 10% of batches |
+
+- **Replicate index k is one physical well / run, shared across the columns of a row (paired tables).** Holes come from dropout, failures and non-detects.
+- **Default draw statistics:** mean n 3.1; 3.4% n = 0 cells; 24% n = 1.
+
+**Side information** ([obs_model.py](obs_model.py)). All new parameters are zero-init and bias-free, so a table without side information equals the model without it at any weights (self-test `python obs_model.py --side`: step 0 vs stock on mean imputation 2e-7; zero flags vs no flags 0.0).
+- **`flag_emb`.** Per-replicate censoring flags {'<', '>'} (value reported at the limit, the convention of [CENSORING.md](CENSORING.md)). They go into the set encoder, and the cell's share of flagged replicates goes into the cell vector, which also reaches n = 1 cells.
+- **`miss_emb`.** A learned vector for n = 0 cells. The backbone value of those cells is always the context column mean, the wrapper's NaN handling (`fill_missing`).
+
+**Runs** ([lane10.sh](experiments/obs_noise/lane10.sh)).
+- Generic branch (center `attn`, no gates), frozen TabICLv2, 6000 steps, the LINCS kill switch.
+- `tx_v6cap_A`: d_s 64, 2 SAB. `tx_v6base_A`: base size, as the control.
+- Validation: v6, v6_gauss, v6_heavy, v6_paired, v6_fail, v6_mnar, v6_lod_flag / v6_lod_noflag (the same draws, flags shown / hidden), plus 5 named modes.
+- Evaluation at 1 and 8 passes.
+
+**Exp 10 first result: both v6 runs hit the LINCS kill switch at step 500.**
+- LINCS at step 500: `tx_v6cap_A` 64.1, `tx_v6base_A` 64.6 (step 0: 65.4, margin 0.5). Capacity is not the cause: the base-size control drops too.
+- Validation at step 500 (cap / base, accuracy):
+  - The named heavy modes improve strongly: Cauchy 0.608 → 0.661 / 0.657, fail_floor 0.600 → 0.636 / 0.618, censored_left_heavy 0.644 → 0.663 / 0.657, contam +1.5.
+  - The v6 settings are flat: v6 0.703 → 0.703 / 0.702.
+  - v6_gauss gets **worse**: 0.729 → 0.726 / 0.727, loss 0.655 → 0.662 / 0.660.
+  - The flags are not used yet: v6_lod_flag = v6_lod_noflag to 0.001.
+- **Headroom of fixed estimators on v6** (TabICLv2, no training; mean / median / Huber imputation):
+
+  | | v6 | v6_gauss | v6_heavy | v6_fail | v6_mnar | v6_lod_flag |
+  |---|---|---|---|---|---|---|
+  | mean | 0.703 | 0.729 | 0.689 | 0.694 | 0.678 | 0.685 |
+  | median | 0.706 | 0.727 | 0.695 | 0.699 | 0.678 | 0.684 |
+  | Huber | 0.706 | 0.729 | 0.695 | 0.700 | 0.679 | 0.688 |
+
+- **Reading.** Most v6 tables carry irreducible noise: large σ, few replicates, so location estimation gains little (Huber vs mean only +0.3). The gradient comes from the heavy-tail and failure tables. The branch buys robustness at the cost of Gaussian efficiency, and near-Gaussian LINCS punishes that.
+  - In v6 only about a third of tables have neither heavy tails nor contamination (0.5 × 0.65); in v5 (which passed) about 70% of the mass was Gaussian-like.
+- **Screen ([lane10s.sh](experiments/obs_noise/lane10s.sh), 500 steps each, the same 6000-step schedule, resumable).**
+  - A: `p_tail` 0.5 → 0.2 (less tail mass).
+  - B: no structured effects (`p_well`, `p_plate`, `p_valhet` = 0).
+  - Training mixture via `--p6`; validation keeps the default P6, so all runs are compared on the same draws.
+
+**Screen result (step 500, LINCS dev; step 0 = 65.4).**
+- **A, `p_tail` 0.2: 65.4, passes.**
+- B, no structured effects: 64.1, killed.
+- **Tail mass is what costs LINCS.** The paired / plate / value-dependent effects do not.
+- The early Gaussian-validation dip (v6_gauss loss 0.655 → 0.660) appears in every run, A included. `tx_v5gen_A` had the same dip at steps 250–1000 (gauss loss 0.689 → 0.692) and had recovered by step 3000, so it is a transient.
+- **Continued ([lane11.sh](experiments/obs_noise/lane11.sh)):**
+  - `tx_v6s_tail_A` (base size) resumed at step 500 → 6000.
+  - `tx_v6tcap_A` (the same prior, d_s 64 + 2 SAB) starts from step 0.
+  - Same kill switch.
+
+**Both tail-reduced runs were killed too:** `tx_v6s_tail_A` 63.98 at step 1000 (65.38 at 500), `tx_v6tcap_A` 62.96 at 500. The screen's step-500 pass was within the noise of a single check, and the tail mass is not the explanation.
+
+**Decomposition on LINCS dose dev** (1 pass; [scratchpad decomp_lincs.py]: zero the additive embedding → center only; feed the cell mean → embedding only).
+
+| checkpoint | full | center only | embedding only | neither (= mean imputation) |
+|---|---|---|---|---|
+| `tx_v5gen_A` (v5, passed) | 65.9 | 61.3 | 64.9 | 65.4 |
+| `tx_v6base_A` (killed @500) | 64.6 | 65.9 | 65.7 | 65.4 |
+| `tx_v6s_tail_A` (killed @1000) | 64.0 | 64.1 | **65.9** | 65.4 |
+| `tx_v6tcap_A` (killed @500) | 63.0 | 62.7 | **65.7** | 65.4 |
+
+- **The learned center (attention over replicates) is what does not transfer.**
+  - In the killed runs center-only ≈ full, and it is below mean imputation.
+  - `tx_v5gen_A`'s center was even worse alone (61.3); its embedding had co-adapted to compensate.
+- **The additive embedding alone beats mean imputation in every v6 run.**
+- **Change (generic, less built-in bias):** center `mean`. The backbone sees the plain cell mean, as at step 0; all learned information goes through the zero-init embedding. Runs `tx_v6m_A` / `tx_v6mcap_A` ([lane12.sh](experiments/obs_noise/lane12.sh)) use the default v6 prior and the same kill switch.
+
+**Mean-center runs, kill checks (LINCS dev; step 0 = 65.4).**
+- `tx_v6m_A` (base size): 64.3 at step 500, **killed**.
+- `tx_v6mcap_A` (d_s 64, 2 SAB): 65.5 at 500, 65.4 at 1000, **passed**. It continues to 6000 and is reported at its last checkpoint.
+- **The mean center does not by itself fix the transfer.** The base run drops as before. Trained jointly, the embedding can shift the backbone's token as a center would, so the "embedding alone is fine" result from the attn runs does not carry over.
+- The single-check noise is about ±0.5–0.7, so one pass vs one kill at this margin is weak evidence about capacity.
+- **Synthetic validation barely improves on v6 in any run.** `tx_v6mcap_A` at step 1000: v6 loss 0.719 → 0.715 (Huber imputation without training: 0.709). The named heavy modes do improve: Cauchy 0.935 → 0.845, fail_floor 0.943 → 0.848.
+  - The v6 prior gives the branch little learnable signal per table (large σ, few replicates).
+  - It needs either a longer schedule or a prior with more cases where the replicates are informative.
+
+**`tx_v6mcap_A` final** (v6 default prior, mean center, d_s 64 + 2 SAB, flags + n = 0 embeddings, 6000 steps).
+- **LINCS dev** after the kill window: 64.9 / 65.5 / 65.8 / 65.0 / 66.7 / 65.3 / 66.2 / 65.3 / 65.4 / 65.4 (steps 1500–6000).
+
+| | synthetic main vs wrapper (1 / 8 passes) | LINCS dev (1 / 8) | LINCS log-loss (8) |
+|---|---|---|---|
+| wrapper, mean input | 0 / +0.1 | 65.3 / 65.7 | 1.006 |
+| Huber imputation | −0.5 / – | 66.4 / 66.1 | 1.018 |
+| `tx_v5gen_A` (v5) | +0.8 / **+1.0** | 65.9 / **66.2** | 1.011 |
+| `tx_v6mcap_A` (v6) | +0.3 / +0.5 | 65.4 / 65.9 | 1.032 |
+| stage B (v2) | +1.9 / +2.0 | 64.0 / 64.2 | – |
+
+- **Synthetic validation on its own prior:** v6 loss 0.719 → 0.705, vs Huber imputation 0.709 (it passed Huber only after about step 2500).
+  - Flags help, but only a little: v6_lod_flag 0.737 vs v6_lod_noflag 0.739, on the same draws.
+  - fail_floor 0.943 → 0.760; Cauchy 0.935 → 0.813; Gaussian unchanged.
+- **Verdict: v6 is not better than v5 on anything we measure.** It is behind on the 27 synthetic sets (+0.5 vs +1.0, 8 vs 8), on LINCS (65.9 vs 66.2) and on log-loss.
+  - The side-information channels work (exact guarantees, a small flag gain) but are not yet worth much.
+  - The held-out real sets were **not** run: no dev evidence justifies spending them.
+
+## Held-out real-data evaluation of `tx_v5gen_A` (2026-10-20; [heldout_eval.sh](experiments/obs_noise/heldout_eval.sh), [heldout_summary.py](experiments/obs_noise/heldout_summary.py))
+
+- **Setup.** The first use of GasDrift, Tox21, UPS1_low and CPTAC for this model. All arms were re-run fresh on the same tasks (`artifacts/real_heldout.jsonl`), all replicates.
+- **Reference:** the off-the-shelf wrapper, mean-imputed input, 8 estimators. Δ is paired per task, mean ± SE (n better).
+- **Metric:** accuracy for LINCS and GasDrift; AUC for the binary Tox21, UPS1_low and CPTAC.
+
+| dataset (tasks) | replicate headroom (wrapper, 1 → all) | Huber imputation, 8 | **`tx_v5gen_A`, 8** | stage B, 8 | log-loss: wrapper / v5gen |
+|---|---|---|---|---|---|
+| L1000 dose (5), dev | +8.9 | −0.5 ± 0.7 | +0.2 ± 1.2 | −3.5 ± 1.3 | 1.424 / 1.427 |
+| Cell Painting dose (5), dev | +12.2 | **+1.4 ± 0.6** | +0.9 ± 0.6 | +0.7 ± 1.3 | 0.588 / 0.595 |
+| GasDrift (9) | +2.0 | +0.4 ± 0.6 | −1.1 ± 0.7 | −1.5 ± 0.9 | 0.869 / 0.690 |
+| Tox21 (12), AUC | +1.5 | +0.2 ± 0.2 | 0.0 ± 0.3 | +0.1 ± 0.2 | 0.170 / 0.167 |
+| UPS1_low (10), AUC | +5.2 | −0.6 ± 0.2 | 0.0 ± 0.3 | −0.8 ± 0.4 | 0.069 / **0.060** |
+| CPTAC (10), AUC | +0.7 | −0.8 ± 0.4 | **+1.3 ± 0.4 (9/10)** | +0.6 ± 0.7 | 0.082 / **0.075** |
+
+- **`tx_v5gen_A` is the most consistent arm.** It is never clearly worse than the wrapper (GasDrift −1.1 ± 0.7 is the weakest).
+  - It shows a clear held-out win on **CPTAC**: +1.3 AUC, 9 of 10 splits, log-loss −9%. CPTAC is the proteomics set with MNAR floor substitution, the replicate pattern the prior's censoring / floor modes model.
+  - It is better calibrated on UPS1_low: log-loss 0.060 vs 0.069, −13%, at equal AUC.
+- **Huber imputation does not generalize.** It is the best arm on Cell Painting and GasDrift, but it loses on both proteomics sets (−0.6, −0.8): non-detect floors break its location estimate.
+- **Stage B (unfrozen backbone) is the least robust:** L1000 −3.5, UPS1_low −0.8. This confirms the stage-A-only decision.
+- **GasDrift log-loss:** every arm of our pipeline (mean imputation included, 0.68) beats the wrapper's 0.87. That comes from the pipeline (preprocessing / ensembling), not the replicate branch.
+- **Overall.** The gains are real but modest: +1 AUC on the one dataset with informative missingness, and calibration gains. Accuracy elsewhere is tied with the wrapper.
+  - Where replicates carry a lot of information (LINCS +9 / +12 from 1 → all), the mean already captures most of it. Neither the branch nor Huber adds much beyond it.
+
+## Exp 11 step 1 — real regression with replicates, training-free (2026-10-20)
+
+**Tasks** ([real_data.py](experiments/obs_noise/real_data.py); designs fixed before any evaluation).
+- **GasConc** (held-out): 6 gases. Target log10 ppmv (UCI 270, the concentration release). Replicates = the 4 sensor units per type.
+- **Tox21Pot** (held-out): 12 assays. Target = median log10 AC50 of substances active in most runs (uncensored target). Features = the other 11 assays' per-run log AC50 (censored at the top concentration) + efficacy.
+- **L1000 / CellPainting `_dose_reg`** (dev): target = dose level on the dose splits.
+- Evaluation: [real_eval_reg.py](experiments/obs_noise/real_eval_reg.py), [reg_real_summary.py](experiments/obs_noise/reg_real_summary.py). CRPS is in context-sd units. Δ is paired vs the wrapper (mean input, 8 est.), negative = better.
+
+| dataset | replicate headroom (wrapper CRPS, 1 → all) | wrapper R² | Huber, 8 | stage A `tx_obs_col_A_reg`, 8 | stage A `colmedg`, 8 | stage B, 8 |
+|---|---|---|---|---|---|---|
+| L1000 dose (dev) | −0.003 | −0.08 | +0.005 ± 0.005 | −0.000 ± 0.005 | −0.006 ± 0.005 | −0.005 ± 0.005 |
+| CellPainting dose (dev) | **−0.074** | 0.36 | +0.000 ± 0.002 | +0.020 ± 0.006 (0/5) | +0.013 ± 0.004 (0/5) | +0.016 ± 0.003 (0/5) |
+| GasConc | −0.002 | 0.93 | −0.000 | +0.001 ± 0.001 | +0.001 ± 0.001 | +0.001 ± 0.000 |
+| Tox21Pot | −0.011 | 0.18 | −0.001 ± 0.001 | **−0.005 ± 0.001 (12/12)** | **−0.005 ± 0.001 (11/12)** | **−0.008 ± 0.002 (12/12)** |
+
+- **The headroom is small.** The replicates matter much less for regression than for LINCS MoA classification:
+  - GasConc is saturated (R² 0.93; one replicate is already as good as four).
+  - L1000 dose is unpredictable (R² < 0), so it is useless as a dev set.
+- **Tox21Pot is a consistent held-out gain for every trained branch** (11–12 of 12 assays), at −1.2% (stage A) to −1.8% (stage B) CRPS, i.e. 50–70% of the 1 → all replicate gain again on top of averaging. Huber imputation gives nothing. As with CPTAC in classification, the gain is on the dataset with censored replicate features.
+- **Cell Painting dose (the only dev set with headroom): every trained branch loses** (+0.013 to +0.020, 0/5), about as much as median imputation (+0.023). These are old v2-prior checkpoints with median-start / learned centers, the transfer failure diagnosed in Exp 9 / 10.
+- **Verdict on step 1: partial.** There is a real but small held-out gain where features are censored, and no clear gain elsewhere. The existing checkpoints carry the known center problem.
+
+## Exp 11 step 2 — regression stage A on the v5 prior + learned context-row attention (2026-10-20, running)
+
+- **`row_attn`** ([obs_model.py](obs_model.py)). The 7 row-reliability features (`row_features`; all exactly 0 for all-single tables) go through a bias-free MLP with a zero-init output, soft-clipped to ±5. The result is a logit bias per context row in every ICL attention ([model.py](model.py) `icl_key_bias`).
+  - Self-test `python obs_model.py --row_attn`: step 0 vs stock 3e-7; n = 1 vs stock at random weights 0.0; the bias changes n > 1 outputs.
+- **Regression kill switch.** `dev_real_eval` returns −100 × CRPS for regression, so a margin of 0.5 = 0.005 CRPS. The dev set is `CellPainting_dose_reg` only (L1000 dose is unpredictable). Step 0 = 0.428 = mean imputation.
+- **Runs** ([lane13.sh](experiments/obs_noise/lane13.sh)). The v5 prior and settings of `tx_v5gen_A`, generic branch (center attn), d_s 64 + 2 SAB, frozen TabICLv2 regression backbone, 4000 steps.
+  - `tx_v5reg_ra_A` (+ `row_attn`) vs `tx_v5reg_A` (control).
+  - Then real regression (dev + GasConc, Tox21Pot) and the 27 synthetic sets, at 1 and 8 passes.

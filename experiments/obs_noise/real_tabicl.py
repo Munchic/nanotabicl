@@ -40,7 +40,7 @@ KS = [1, 2, 3, 'all']
 def main():
     ckpt = base_ckpt_path()
     datasets = sys.argv[1].split(',') if len(sys.argv) > 1 else ['L1000', 'CellPainting']
-    out = os.path.join(ROOT, 'artifacts', 'real_eval.jsonl')
+    out = os.environ.get('REAL_OUT', os.path.join(ROOT, 'artifacts', 'real_eval.jsonl'))
     for ds in datasets:
         for f in sorted(glob.glob(os.path.join(ROOT, 'artifacts', 'real', ds, '*.npz'))):
             z = np.load(f)

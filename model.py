@@ -34,7 +34,17 @@ class NanoTabICLv2(nn.Module):
         self.out_mlp = get_mlp(icl_dim, icl_dim * 2, out_dim)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, extra_emb: typing.Optional[torch.Tensor] = None,
-                extra_row_emb: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+                extra_row_emb: typing.Optional[torch.Tensor] = None,
+                key_bias: typing.Optional[torch.Tensor] = None,
+                icl_key_bias: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+        # key_bias (B, n_rows), optional: added to the attention logits of every attention over rows (column-stage
+        # inducing attention, ICL attention) where the row is a key; e.g. -log(group size) for group-normalized
+        # attention (replicate wells as rows: each experimental unit then counts once). None / zeros == unchanged.
+        # icl_key_bias (B, n_rows), optional: the same, in the ICL attention only (e.g. learned context-row reliability).
+        if icl_key_bias is not None:
+            icl_key_bias = icl_key_bias if key_bias is None else key_bias + icl_key_bias
+        else:
+            icl_key_bias = key_bias
         n_batch, n_rows, n_cols = x.shape
         n_batch, n_train = y.shape
 
@@ -51,8 +61,9 @@ class NanoTabICLv2(nn.Module):
         emb[:, :n_train] += self.y_embed_in(y[:, :, None, None])
 
         # ----- TF_col: induced self-attention within each column
+        kb_col = None if key_bias is None else key_bias.repeat_interleave(n_cols, 0)  # (B * C, R), col_attn's batch order
         for block in self.col_blocks:
-            emb = block.col_attn(emb, kv_max_idx=n_train)  # all rows only attend to training rows
+            emb = block.col_attn(emb, kv_max_idx=n_train, key_bias=kb_col)  # all rows only attend to training rows
 
         # ----- TF_row: concat CLS tokens as extra columns -> row attention -> norm + merge cls tokens
         emb = torch.cat([self.row_cls_tokens.expand(n_batch, n_rows, -1, -1), emb], dim=2)
@@ -67,8 +78,9 @@ class NanoTabICLv2(nn.Module):
         # now emb.shape = (n_batch, n_rows, icl_dim)
         emb[:, :n_train] += self.y_embed_icl(y[:, :, None])  # add y embeddings again
         for block in self.icl_blocks[:-1]:
-            emb = block(emb, kv_max_idx=n_train)  # all rows only attend to training rows
-        emb = self.icl_blocks[-1](emb[:, n_train:], emb[:, :n_train])  # need only test predictions
+            emb = block(emb, kv_max_idx=n_train, key_bias=icl_key_bias)  # all rows only attend to training rows
+        emb = self.icl_blocks[-1](emb[:, n_train:], emb[:, :n_train],  # need only test predictions
+                                  key_bias=None if icl_key_bias is None else icl_key_bias[:, :n_train])
 
         return self.out_mlp(self.out_ln(emb))  # output MLP
 
@@ -123,8 +135,10 @@ class InducedTransformerBlock(TableAttnBase):
         self.tfm2 = TransformerBlock(embed_dim=embed_dim, num_heads=num_heads)  # fixed nb of ind. vectors -> no ssmax
         self.inducing_vectors = nn.Parameter(0.02 * torch.randn(1, n_inducing, embed_dim))
 
-    def forward(self, q, kv=None, q_max_idx: typing.Optional[int] = None, kv_max_idx: typing.Optional[int] = None):
-        kv = self.tfm1(self.inducing_vectors.expand(q.shape[0], -1, -1), q if kv is None else kv, kv_max_idx=kv_max_idx)
+    def forward(self, q, kv=None, q_max_idx: typing.Optional[int] = None, kv_max_idx: typing.Optional[int] = None,
+                key_bias: typing.Optional[torch.Tensor] = None):
+        kv = self.tfm1(self.inducing_vectors.expand(q.shape[0], -1, -1), q if kv is None else kv, kv_max_idx=kv_max_idx,
+                       key_bias=key_bias)
         return self.tfm2(q, kv, q_max_idx=q_max_idx)
 
 
@@ -137,27 +151,34 @@ class TransformerBlock(nn.MultiheadAttention, TableAttnBase):
         self.ln_attn = nn.LayerNorm(embed_dim)
         self.ln_mlp = nn.LayerNorm(embed_dim)
 
-    def forward(self, q, kv=None, q_max_idx: typing.Optional[int] = None, kv_max_idx: typing.Optional[int] = None):
-        # q.shape: (batch_size, q_len, embed_dim), kv.shape: (batch_size, kv_len, embed_dim)
+    def forward(self, q, kv=None, q_max_idx: typing.Optional[int] = None, kv_max_idx: typing.Optional[int] = None,
+                key_bias: typing.Optional[torch.Tensor] = None):
+        # q.shape: (batch_size, q_len, embed_dim), kv.shape: (batch_size, kv_len, embed_dim); key_bias: (batch, kv_len)
         x, q = q, self.ln_attn(q)
         kv = q if kv is None else self.ln_attn(kv)
-        if kv_max_idx is not None: kv = kv[..., :kv_max_idx, :]
+        if kv_max_idx is not None:
+            kv = kv[..., :kv_max_idx, :]
+            key_bias = None if key_bias is None else key_bias[..., :kv_max_idx]
         if q_max_idx is not None: x, q = x[..., :q_max_idx, :], q[..., :q_max_idx, :]
 
-        x = x + self.attn(q, kv)
+        x = x + self.attn(q, kv, key_bias)
         del q, kv  # save memory during inference
         return x + self.mlp(self.ln_mlp(x))  # we use pre-norm here and for the attention as well
 
-    def attn(self, q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    def attn(self, q: torch.Tensor, k: torch.Tensor, key_bias: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
         # Joint projection of (q, k, v), then transpose heads to (batch_size, num_heads, len, head_dim)
         q, k, v = nn.functional._in_projection_packed(q, k, k, self.in_proj_weight, self.in_proj_bias)
         q, k, v = (t.unflatten(-1, (self.num_heads, self.head_dim)).transpose(-3, -2) for t in [q, k, v])
 
-        q = q if self.ssmax_layer is None else self.ssmax_layer(q=q, n=k.size(-2))  # SSMax (optional)
+        # SSMax (optional) keeps the real key count even with a key bias: the effective count sum(exp(bias)) flattens
+        # attention over the real keys (LINCS, wells as rows + group bias: -20 points vs neutral with the real count)
+        q = q if self.ssmax_layer is None else self.ssmax_layer(q=q, n=k.size(-2))
         q, k = (t if self.rope is None else self.rope(t) for t in [q, k])  # RoPE (optional)
 
         # attention with heads in batch dim (maybe needed for FlashAttention) -> put the head dim back -> out projection
-        attn_output = nn.functional.scaled_dot_product_attention(*[t.flatten(0, 1) for t in (q, k, v)]).view(q.shape)
+        mask = None if key_bias is None else key_bias[:, None, None, :].expand(-1, q.shape[1], 1, -1).flatten(0, 1).to(q.dtype)
+        attn_output = nn.functional.scaled_dot_product_attention(*[t.flatten(0, 1) for t in (q, k, v)],
+                                                                 attn_mask=mask).view(q.shape)
         del q, k, v  # save memory during inference
         return self.out_proj(attn_output.transpose(-3, -2).flatten(-2, -1))  # (batch_size, q_len, embed_dim)
 

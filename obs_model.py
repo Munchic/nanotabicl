@@ -5,8 +5,14 @@ from model import NanoTabICLv2, get_mlp
 class ReplicateEncoder(nn.Module):  # set encoder over the replicates of one cell -> (d_s + 1)-dim vector
     def __init__(self, d_s: int = 32, n_heads: int = 4, use_sab: bool = True, use_null: bool = True,
                  med_feat: bool = False, loc_head: bool = False, robust_feats: bool = False, pool: str = 'attn',
-                 col_ctx: bool = False, n_sab: int = 1, col_tok: int = 0):
+                 col_ctx: bool = False, n_sab: int = 1, col_tok: int = 0, flag_emb: bool = False):
         super().__init__()
+        # flag_emb: user-supplied per-replicate censoring flags {'<' below a limit, '>' above a limit} (the value is
+        # reported AT the limit), bias-free zero-init map of the one-hot added to every replicate embedding; unflagged
+        # replicates (or flags=None) contribute exactly 0
+        self.flag_emb = nn.Linear(2, d_s, bias=False) if flag_emb else None
+        if flag_emb:
+            nn.init.zeros_(self.flag_emb.weight)
         # pool: 'attn' = learned seed query + null key/value (default); 'v2s' = Vec2Summ-style moment summary of the
         # replicate embeddings (Li et al. 2025): LN(W [mean_k h_k, log(var_k h_k + eps)])
         self.pool = pool
@@ -42,9 +48,11 @@ class ReplicateEncoder(nn.Module):  # set encoder over the replicates of one cel
     def heads(self, t):  # (M, L, d) -> (M, H, L, d/H)
         return t.unflatten(-1, (self.n_heads, -1)).transpose(1, 2)
 
-    def forward(self, z: torch.Tensor, mask: torch.Tensor, tie: torch.Tensor | None = None, ctx_fn=None, ctx_tokens=None):
+    def forward(self, z: torch.Tensor, mask: torch.Tensor, tie: torch.Tensor | None = None, ctx_fn=None, ctx_tokens=None,
+                flags: torch.Tensor | None = None):
         # z: (M, K) standardized replicates (padding arbitrary), mask: (M, K) bool, every row has >= 2 valid entries
         # tie: (M, K) bool, replicate equals the column's extreme context value (robust_feats only)
+        # flags: (M, K, 2) float one-hot of '<' / '>' (flag_emb only)
         # returns (cell vector (M, d_s + 1), location scores (M, K) or None)
         z = torch.where(mask, z, 0.0)
         n = mask.sum(-1, keepdim=True)
@@ -61,6 +69,8 @@ class ReplicateEncoder(nn.Module):  # set encoder over the replicates of one cel
                       tie.to(z.dtype)]
         f = torch.stack(feats, dim=-1)
         h = self.phi(f)  # (M, K, d_s)
+        if flags is not None and self.flag_emb is not None:
+            h = h + self.flag_emb(flags.to(h.dtype))
         if ctx_fn is not None:  # column context: (M, d_s) per-cell summary -> (M, d_s) additive term for every replicate
             u = (self.phi_col(f) * mask[..., None].to(h.dtype)).sum(1) / n.to(h.dtype)
             h = h + ctx_fn(u)[:, None].to(h.dtype)
@@ -155,8 +165,23 @@ def huber_location(reps: torch.Tensor, mask: torch.Tensor, n_train: int, iters: 
         w = torch.where(mask, (HUBER_C * sig / (x - mu[..., None]).abs().clamp(min=1e-12)).clamp(max=1.0), 0.0)
         mu = (w * x).sum(-1) / w.sum(-1).clamp(min=1e-12)
     mean = x.sum(-1) / n.clamp(min=1)
+    mu = torch.where((sig[..., 0] <= 1e-12).expand_as(mu), med, mu)  # degenerate scale (ties): the median limit
     mu = torch.where(torch.isfinite(sig[..., 0]).expand_as(mu), mu, mean)
     return torch.where(n > 1, mu, mean).to(reps.dtype)
+
+
+def fill_missing(reps: torch.Tensor, mask: torch.Tensor, n_train: int):
+    """n = 0 cells (no measurement) -> one replicate at the column mean of the CONTEXT cell means (= the TabICLv2
+    wrapper's NaN imputation). -> reps, mask, missing (B, R, C) bool or None (no n = 0 cell: inputs returned as is)."""
+    n = mask.sum(-1)
+    missing = n == 0
+    if not missing.any():
+        return reps, mask, None
+    cm = torch.where(mask, reps, 0.0).sum(-1) / n.clamp(min=1)
+    ok = (~missing[:, :n_train]).to(reps.dtype)
+    fill = (cm[:, :n_train] * ok).sum(1, keepdim=True) / ok.sum(1, keepdim=True).clamp(min=1)  # (B, 1, C)
+    first = (torch.arange(reps.shape[-1], device=reps.device) == 0) & missing[..., None]
+    return torch.where(first, fill[..., None], reps), mask | first, missing
 
 
 def masked_median(v: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:  # lower median over valid entries (last dim)
@@ -175,8 +200,16 @@ class ObsNanoTabICL(NanoTabICLv2):
                  center: str = 'mean', med_feat: bool = False, std: str = 'meansd', zclip: float = 0.0,
                  robust_feats: bool = False, single_emb: str = 'none', temp_head: bool = False, dist_emb: bool = False,
                  pool: str = 'attn', row_emb: bool = False, aux: bool = False, aux_center: bool = True,
-                 col_ctx: bool = False, n_sab: int = 1, col_tok: int = 0, col_tok_target: bool = False, **kwargs):
+                 col_ctx: bool = False, n_sab: int = 1, col_tok: int = 0, col_tok_target: bool = False,
+                 gate_colstats: bool = False, flag_emb: bool = False, miss_emb: bool = False, row_attn: bool = False,
+                 **kwargs):
         super().__init__(*args, **kwargs)
+        # Side information (Exp 10), both optional, zero-init, bias-free -> tables without it equal the model without it
+        # at any weights. flag_emb: per-replicate censoring flags (forward(..., flags=)) into the set encoder, plus the
+        # cell's share of '<' / '>' replicates mapped into the cell vector (reaches n = 1 cells too). miss_emb: learned
+        # vector for n = 0 cells (no measurement). n = 0 cells are always filled (see fill_missing): the backbone gets
+        # the context column mean, as the TabICLv2 wrapper does for a NaN cell.
+        self.flag_emb, self.miss_emb = flag_emb, miss_emb
         # aux: training-only denoising targets for replicated cells (the clean value is known in pretraining).
         # rep_aux: linear head on the cell vector -> quantiles AUX_TAUS of the clean z; the learned center is also
         # pulled toward the clean value. Not used in forward -> both guarantees are unaffected.
@@ -218,13 +251,23 @@ class ObsNanoTabICL(NanoTabICLv2):
         # 'attn_huberg': Huber start (huber_location, column-pooled scale): center = huber + g1 (median - huber) +
         # g2 (attention center - huber); step 0 == Huber imputation (about the mean under Gaussian noise, the median under
         # outliers: the strongest simple baseline on the LINCS dev tasks, +1.0 over the mean)
+        # gate_colstats: the gate also sees N_COLSTATS column-level noise statistics of the context replicates (pooled
+        # robust scale, outlier share, tail quantile, limit-tie share; column_noise_stats), so that it can keep the Huber /
+        # mean behaviour on Gaussian-like columns and robustify on heavy-tailed ones (a cell's own 2-5 replicates cannot
+        # tell the two apart)
+        self.gate_colstats = gate_colstats
         if center in ('attn_medg', 'attn_meang', 'attn_huberg'):
-            self.rep_gate = nn.Linear(d_s + 1, 1 if center == 'attn_medg' else 2)
+            self.rep_gate = nn.Linear(d_s + 1 + self.N_COLSTATS * gate_colstats, 1 if center == 'attn_medg' else 2)
             nn.init.zeros_(self.rep_gate.weight)
             nn.init.zeros_(self.rep_gate.bias)
         self.rep_enc = ReplicateEncoder(d_s=d_s, n_heads=rep_heads, use_sab=use_sab, use_null=use_null,
                                         med_feat=med_feat, loc_head=center in ('attn', 'attn_med', 'attn_medg', 'attn_meang', 'attn_huberg'), robust_feats=robust_feats, pool=pool,
-                                        col_ctx=col_ctx, n_sab=n_sab, col_tok=col_tok)
+                                        col_ctx=col_ctx, n_sab=n_sab, col_tok=col_tok, flag_emb=flag_emb)
+        if flag_emb:
+            self.rep_flag_cell = nn.Linear(2, d_s + 1, bias=False)
+            nn.init.zeros_(self.rep_flag_cell.weight)
+        if miss_emb:
+            self.rep_missing = nn.Parameter(torch.zeros(d_s + 1))
         # col_tok: richer column context. Every CONTEXT cell of a column (replicated or single) is summarized as
         # [median z, log n, log(1 + MAD z), share of limit ties, n == 1] (+ its row's label with col_tok_target, context
         # rows only -> leak-free), embedded, and pooled by col_tok learned seed queries into col_tok tokens (several modes,
@@ -263,6 +306,13 @@ class ObsNanoTabICL(NanoTabICLv2):
         # row_emb (NOTES.md Stage 2, implicit form): the same row reliability features, mapped (bias-free, zero-init)
         # into each row's ICL token, so in-context attention can learn to discount unreliable context rows
         self.row_emb = row_emb
+        # row_attn (A2, Stage 2 proper): the same features -> a learned logit bias per CONTEXT row in every ICL attention
+        # (bias-free, zero-init; soft-clipped to +-5), so queries can down-weight unreliable context rows. Features are 0
+        # for all-single tables -> the bias is skipped there (stock exactly); step 0 == the model without it.
+        self.row_attn = row_attn
+        if row_attn:
+            self.rep_row_attn = nn.Sequential(nn.Linear(7, 32, bias=False), nn.Tanh(), nn.Linear(32, 1, bias=False))
+            nn.init.zeros_(self.rep_row_attn[-1].weight)
         if row_emb:
             self.rep_row = nn.Sequential(nn.Linear(7, 32, bias=False), nn.Tanh(),
                                          nn.Linear(32, self.out_ln.normalized_shape[0], bias=False))
@@ -274,12 +324,19 @@ class ObsNanoTabICL(NanoTabICLv2):
             nn.init.zeros_(self.rep_single[-1].weight)
             nn.init.zeros_(self.rep_single[-1].bias)
 
-    def forward(self, reps: torch.Tensor, mask: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, reps: torch.Tensor, mask: torch.Tensor, y: torch.Tensor, flags: torch.Tensor | None = None) -> torch.Tensor:
+        """flags: optional (B, R, C, K) int {0 observed / not given, 1 '<', 2 '>'} (needs flag_emb to have an effect)."""
         n_train = y.shape[1]
-        x_c, extra_emb = self.cell_inputs(reps, mask, n_train=n_train, y=y)
-        feats = self.row_features(reps, mask, n_train) if (self.temp_head or self.row_emb) else None
+        reps, mask, missing = fill_missing(reps, mask, n_train)
+        if flags is not None and missing is not None:
+            flags = torch.where(missing[..., None], 0, flags)
+        x_c, extra_emb = self.cell_inputs(reps, mask, n_train=n_train, y=y, flags=flags, missing=missing)
+        feats = self.row_features(reps, mask, n_train) if (self.temp_head or self.row_emb or self.row_attn) else None
         row_extra = self.rep_row(feats.to(extra_emb.dtype)) if self.row_emb else None
-        out = super().forward(x_c, y, extra_emb=extra_emb, extra_row_emb=row_extra)
+        icl_bias = None
+        if self.row_attn and bool(feats.abs().amax() > 0):
+            icl_bias = 5 * torch.tanh(self.rep_row_attn(feats.to(extra_emb.dtype)).squeeze(-1) / 5)  # (B, R)
+        out = super().forward(x_c, y, extra_emb=extra_emb, extra_row_emb=row_extra, icl_key_bias=icl_bias)
         if self.temp_head:
             log_t = self.rep_temp(feats[:, n_train:].to(out.dtype)).clamp(-3, 3)
             if self.is_regression:
@@ -291,6 +348,31 @@ class ObsNanoTabICL(NanoTabICLv2):
         return out
 
     N_RFF, NU0 = 8, 3.0
+    N_COLSTATS = 4
+
+    @torch.no_grad()
+    def column_noise_stats(self, z, mask, n, tie, n_train):
+        """(B, 1, C, 4) column noise statistics from the replicated context cells, in the encoder's standardized units:
+        log pooled robust scale (as huber_location), share of replicates > 3 pooled sd from their cell median, log 90th
+        percentile of the standardized residuals, share of replicates tied at a column extreme (0 without robust_feats)."""
+        B, R, C, K = z.shape
+        zf = torch.where(mask, z, 0.0).float()
+        med = linear_median(zf, mask)
+        fac = torch.tensor(HUBER_SCALE_FACTOR + [HUBER_SCALE_FACTOR[-1]] * max(0, K + 1 - len(HUBER_SCALE_FACTOR)),
+                           device=z.device)[n.clamp(max=len(HUBER_SCALE_FACTOR) - 1)]
+        res = (zf - med[..., None]).abs() * fac[..., None]
+        ok = mask & (n >= 2)[..., None] & (torch.arange(R, device=z.device) < n_train)[None, :, None, None]
+        okf = ok.transpose(1, 2).reshape(B, C, -1)
+        cnt = okf.sum(-1).clamp(min=1)
+        srt = torch.where(okf, res.transpose(1, 2).reshape(B, C, -1), float('inf')).sort(-1).values
+        q = lambda p: srt.gather(-1, ((p * (cnt - 1)).long())[..., None]).squeeze(-1)
+        sig = q(0.5).clamp(min=1e-4)
+        stdz = res / sig[:, None, :, None]
+        out = (torch.where(ok, stdz > 3, False)).transpose(1, 2).reshape(B, C, -1).sum(-1) / cnt
+        tie_s = ((tie & ok).transpose(1, 2).reshape(B, C, -1).sum(-1) / cnt) if tie is not None else torch.zeros_like(out)
+        f = torch.stack([torch.log(sig), 10 * out, torch.log((q(0.9) / sig).clamp(min=1e-3)), tie_s], dim=-1)
+        f = torch.where((okf.sum(-1) > 0)[..., None], f, 0.0)  # columns without replicated context cells: 0
+        return f[:, None]  # (B, 1, C, 4)
     ALPHA_SCALE = 10.0  # gate parameterization: Adam moves rep_alpha by ~lr per step -> the gate by ~10 lr
     AUX_TAUS = (0.1, 0.25, 0.5, 0.75, 0.9)
 
@@ -383,11 +465,15 @@ class ObsNanoTabICL(NanoTabICLv2):
         tok = nn.functional.scaled_dot_product_attention(q, k, v).transpose(1, 2).flatten(-2)  # (B*C, col_tok, d_s)
         return self.rep_tok_out(tok).view(B, C, self.col_tok, -1)
 
-    def cell_inputs(self, reps: torch.Tensor, mask: torch.Tensor, n_train: int, y: torch.Tensor | None = None):
+    def cell_inputs(self, reps: torch.Tensor, mask: torch.Tensor, n_train: int, y: torch.Tensor | None = None,
+                    flags: torch.Tensor | None = None, missing: torch.Tensor | None = None):
         """-> (per-cell value fed to the backbone (B, R, C), additive encoder embedding (B, R, C, embed_dim))."""
         n_batch, n_rows, n_cols, _ = reps.shape
         reps = torch.where(mask, reps, 0.0)
         n = mask.sum(-1)
+        flag_oh = None
+        if flags is not None and self.flag_emb:
+            flag_oh = (nn.functional.one_hot(flags.long().clamp(0, 2), 3)[..., 1:] * mask[..., None]).float()  # (B, R, C, K, 2)
         x = reps.sum(-1) / n.clamp(min=1)  # cell means -> backbone, exactly like a single observed value
         # standardize replicates with the training rows' column statistics: of the cell means (the spec), or of the
         # cell medians for center in (median, attn) -- robust to cell means blown up by heavy-tailed replicates
@@ -432,13 +518,18 @@ class ObsNanoTabICL(NanoTabICLv2):
                 tok = self.column_tokens(z, mask, n, tie, n_train, y)  # (B, C, T, d_s)
                 ctx_tokens = tok[:, None].expand(n_batch, n_rows, n_cols, -1, -1)[multi]
             enc_args = (z[multi], mask[multi], None if tie is None else tie[multi])
+            enc_kw = dict(ctx_fn=ctx_fn, ctx_tokens=ctx_tokens, flags=None if flag_oh is None else flag_oh[multi])
             if self.training and torch.is_grad_enabled():  # activation checkpointing: the replicate attention maps
                 # (cells x heads x K x K, K up to 50) are recomputed in backward instead of stored; same math, ~flat memory
-                vec, scores = torch.utils.checkpoint.checkpoint(self.rep_enc, *enc_args, ctx_fn=ctx_fn, ctx_tokens=ctx_tokens,
-                                                                use_reentrant=False)
+                vec, scores = torch.utils.checkpoint.checkpoint(self.rep_enc, *enc_args, **enc_kw, use_reentrant=False)
             else:
-                vec, scores = self.rep_enc(*enc_args, ctx_fn=ctx_fn, ctx_tokens=ctx_tokens)
+                vec, scores = self.rep_enc(*enc_args, **enc_kw)
             cell[multi] = vec.to(cell.dtype)
+            if self.center in ('attn_medg', 'attn_meang', 'attn_huberg'):
+                gate_in = vec.to(self.rep_gate.weight.dtype)
+                if self.gate_colstats:
+                    cs = self.column_noise_stats(z, mask, n, tie, n_train).expand(n_batch, n_rows, n_cols, -1)[multi]
+                    gate_in = torch.cat([gate_in, cs.to(gate_in.dtype)], dim=-1)
             if self.center in ('attn', 'attn_med', 'attn_medg', 'attn_meang', 'attn_huberg'):  # learned location
                 w = torch.softmax(scores.float().masked_fill(~mask[multi], float('-inf')), dim=-1)
                 att = (w * reps[multi]).sum(-1)
@@ -448,10 +539,10 @@ class ObsNanoTabICL(NanoTabICLv2):
                     att = med + self.ALPHA_SCALE * self.rep_alpha.float() * (att - med)
                 elif self.center == 'attn_medg':
                     med = linear_median(reps[multi], mask[multi])
-                    att = med + self.rep_gate(vec.to(self.rep_gate.weight.dtype)).float().squeeze(-1) * (att - med)
+                    att = med + self.rep_gate(gate_in).float().squeeze(-1) * (att - med)
                 elif self.center in ('attn_meang', 'attn_huberg'):
                     mu = (x[multi] if self.center == 'attn_meang' else huber_location(reps, mask, n_train)[multi]).float()
-                    gt = self.rep_gate(vec.to(self.rep_gate.weight.dtype)).float()
+                    gt = self.rep_gate(gate_in).float()
                     med = linear_median(reps[multi], mask[multi])
                     att = mu + gt[:, 0] * (med - mu) + gt[:, 1] * (att - mu)
                 x_c[multi] = att.to(x.dtype)
@@ -474,6 +565,10 @@ class ObsNanoTabICL(NanoTabICLv2):
                     inp = cell.new_zeros(n_batch, 1, n_cols, 1)
                 e1 = self.rep_single(inp.to(cell.dtype)).to(cell.dtype)  # (B, 1, C, d_s + 1)
                 cell = torch.where(use[..., None], e1.expand_as(cell), cell)
+        if flag_oh is not None:  # share of '<' / '>' replicates of the cell (all cells, n = 1 included)
+            cell = cell + self.rep_flag_cell(flag_oh.sum(-2) / n.clamp(min=1)[..., None].to(flag_oh.dtype)).to(cell.dtype)
+        if missing is not None and self.miss_emb:
+            cell = cell + missing[..., None].to(cell.dtype) * self.rep_missing.to(cell.dtype)
         idxs = torch.arange(n_cols, device=reps.device)
         grouped = torch.cat([cell[:, :, (idxs + (2 ** i - self.group_shift)) % n_cols]
                              for i in range(self.feature_group_size)], dim=-1)
@@ -512,3 +607,33 @@ if __name__ == '__main__':  # step 0 == stock model, and n = 1 everywhere == sto
     print('n>1, trained U: max|diff| =', (obs(reps, mask, y) - stock(xm, y)).abs().max().item(), '(should be > 0)')
     print('params: stock %.3fM, replicate branch %.3fM' % (sum(p.numel() for p in stock.parameters()) / 1e6,
           sum(p.numel() for n_, p in obs.named_parameters() if n_.startswith('rep_')) / 1e6))
+    if '--side' in __import__('sys').argv:  # side information: flags + n = 0 cells
+        side = ObsNanoTabICL(**cfg, center='attn', med_feat=True, std='medmad', zclip=10.0, robust_feats=True,
+                             dist_emb=True, temp_head=True, col_ctx=True, n_sab=2, d_s=64, flag_emb=True, miss_emb=True)
+        side.load_state_dict(stock.state_dict(), strict=False)
+        holes = mask & (torch.rand(B, R, C, K) > 0.3)  # holes anywhere, some cells n = 0
+        flags = torch.randint(0, 3, (B, R, C, K)) * (torch.rand(B, R, C, K) < 0.2)
+        hm = torch.where(holes, reps, 0).sum(-1) / holes.sum(-1).clamp(min=1)
+        miss = holes.sum(-1) == 0
+        fill = (hm[:, :n_train] * ~miss[:, :n_train]).sum(1, keepdim=True) / (~miss[:, :n_train]).sum(1, keepdim=True)
+        hm = torch.where(miss, fill, hm)
+        print(f'side: {miss.float().mean():.1%} n=0 cells; step0 with flags + n=0 vs stock(mean, column-mean fill):',
+              (side(reps, holes, y, flags=flags) - stock(hm, y)).abs().max().item())
+        for m_ in [side.rep_proj, side.rep_col, side.rep_dist, side.rep_temp, side.rep_flag_cell, side.rep_enc.flag_emb]:
+            [nn.init.normal_(p_) for p_ in m_.parameters()]
+        nn.init.normal_(side.rep_missing)
+        a = side(reps, mask, y)
+        print('side, random weights: zero flags == no flags:', (side(reps, mask, y, flags=torch.zeros_like(flags)) - a).abs().max().item(),
+              '| flags change output:', (side(reps, mask, y, flags=flags) - a).abs().max().item(), '(> 0)',
+              '| n=1 + flags change output:', (side(reps, m1, y, flags=flags) - side(reps, m1, y)).abs().max().item(), '(> 0)')
+    if '--row_attn' in __import__('sys').argv:  # learned context-row attention bias
+        ra = ObsNanoTabICL(**cfg, center='attn', med_feat=True, std='medmad', zclip=10.0, robust_feats=True,
+                           dist_emb=True, temp_head=True, col_ctx=True, row_attn=True)
+        ra.load_state_dict(stock.state_dict(), strict=False)
+        print('row_attn: step0 vs stock(mean):', (ra(reps, mask, y) - stock(torch.where(mask, reps, 0).sum(-1) / mask.sum(-1), y)).abs().max().item())
+        for m_ in [ra.rep_proj, ra.rep_col, ra.rep_dist, ra.rep_temp]:
+            [nn.init.normal_(p_) for p_ in m_.parameters()]
+        a = ra(reps, mask, y)
+        [nn.init.normal_(p_) for p_ in ra.rep_row_attn.parameters()]
+        print('row_attn, random weights: n=1 vs stock:', (ra(reps, m1, y) - stock(reps[..., 0], y)).abs().max().item(),
+              '| bias changes n>1 output:', (ra(reps, mask, y) - a).abs().max().item(), '(> 0)')
