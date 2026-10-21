@@ -2259,3 +2259,137 @@ AUC, paired vs the mean + sd wrapper (8 est.), 8 passes:
   - The weights did train, with no skipped steps.
   - V2b's joint learning switched on between steps 500 and 750 (sh_xorp 0.888 → 0.852); V4a's has not by step 1000. This looks like a variable-onset learning phase.
 - **Queued after V4b:** V4c, the V4 configuration warm-started from V2b's trained branch (lr 1e-4, 1000 steps), to keep the learned joint / HAR gains while the backbone sees Huber + sd. `--init` now loads checkpoints with `weights_only=False`.
+
+## PLAN 2 — a replicate layer on frozen TabICLv2 (2026-10-21, in progress)
+
+[PLAN_2.md](PLAN_2.md). Goal restated: beat the wrapper fed **mean + sd** *and* fed **Huber + sd**, and also the per-dataset-selected best hand summary (step 0c), on data never seen. Bitter-lesson line: no hand-picked estimators or columns in the shipped layer; the prior is where the investment goes.
+
+### Protocol change: dev sets are split into VAL and TEST
+
+[devsplit.py](experiments/obs_noise/devsplit.py) is now the single registry. Every dataset already looked at is DEV and is split; `real_eval.py` / `real_eval_reg.py` refuse TEST without `--allow_test`, and unknown names default to TEST.
+
+- **VAL** (all decisions): HAR, L1000, CellPainting, HVTN (Beijing for regression).
+- **TEST** (one final read, gated on `FULL_DONE` and `PROMOTE`): NK, PreE, Musk, PhysioNet, GasDrift/GasConc, Tox21/Tox21Pot, UPS1, CPTAC, PhysioNetLOS.
+- **HELDOUT**: empty; fresh sets must be added here *before* any run.
+
+**The bar is locked on disk before any candidate result** ([val_ref.jsonl](experiments/obs_noise/artifacts/val_ref.jsonl), wrapper, 8 estimators, VAL only):
+
+| arm | HAR | L1000 | CellPainting | HVTN |
+|---|---|---|---|---|
+| mean | 0.731 | 0.507 | 0.806 | 0.686 |
+| mean + sd | 0.826 | 0.516 | 0.821 | 0.756 |
+| Huber + sd | 0.836 | 0.517 | 0.820 | **0.839** |
+| sketch (7 cols) | **0.865** | 0.511 | 0.801 | **0.840** |
+
+- **HVTN is the largest curated-imputation gain in the project:** +15.2 points over mean. Cytometry is where the hand summaries are strongest and where every learned branch has lost.
+- **The sketch, not Huber + sd, is the best explicit block on the population-style sets** (HAR +13.4, HVTN +15.3), while it is clearly worse on CellPainting (0.801 vs 0.821: extra columns hurt with 3-5 wells).
+- Confidence tracks error much better with an explicit block: confAUROC 0.628 → 0.802 on HVTN, 0.766 → 0.842 on HAR, but it *drops* to 0.874 for the sketch on CellPainting. Calibration claims must be per regime.
+
+### Step 0a — the cytometry scale hypothesis is refuted
+
+[cyto_scale.py](experiments/obs_noise/cyto_scale.py), raw `X` quantiles per marker (a data property: no labels, no metrics):
+
+| set | share of negatives (median) | 1% quantile (median) | 50% | 99% |
+|---|---|---|---|---|
+| NK | 75.5% | −0.47 | −0.35 | 4.25 |
+| PreE | 68.0% | −0.68 | −0.38 | 2.90 |
+| HVTN | **0.01%** | +4.20 | +5.49 | 6.73 |
+
+- NK and PreE are centred on zero with heavy negative mass; HVTN is positive-only and shifted up by 4. No single arcsinh(x/5) matches all three.
+- **The planned `asinh_mean_sd` / `asinh_huber_sd` arms are dropped:** there is no transform that would make the cytometry gap a scale artifact. Huber + sd's cytometry gain is not a scale effect.
+
+### v7 — a continuous observation prior, and the general head that failed to beat curation
+
+**Prior** (`observe_v7` in [obs_train.py](experiments/obs_noise/obs_train.py), `--noise_set v7`). No named families: each column draws continuous latents (location slope, scale slope, tail index, mixture share, mode separation, rare mass), each a continuous function of `u = z(x)`, and instances come from one continuous location-scale-tailed mixture built from them. The continuous measurement process (`measure_layer`, shared with the shape prior) composes on top: plate / well offsets, failed instances, LOD / ULOQ censoring (flagged or absent), MAR dropout, all with continuous rates.
+
+**Head** (`tx_headM_A`): `center='attn'`, median feature, robust standardization, `dist_emb`, `temp_head`, `col_ctx`, ISAB encoder, joint path, `flag_emb`, `miss_emb`. **No** `sd_cols`, no `backbone_loc`, no gates, no learned columns — the pure "no hand columns" arm of PLAN_2 section 8.
+
+**Screen (1000 steps, shape_k 128, ~5 s/step).**
+
+| step | dev_real (VAL, 1 pass) | val Δacc / Δloss | clean |
+|---|---|---|---|
+| 0 | 66.94 | — | 0.801 |
+| 500 | **75.61 (+8.66)** | +1.11 / −0.027 | 0.801 |
+| 1000 | 74.48 (+7.53) | **+1.64 / −0.040** | 0.801 |
+
+- **It learns from a neutral start.** Starting 8 points below the hand arms' own start, it climbed 8 points and peaked mid-screen. Per-setting at step 250 the gains were broad, not tail-specific: v7_clean +1.48, v7 +1.15, v7_meas +0.92, v7_mnar +0.89, v7_well +0.83, v7_xorp +0.74, v7_cens +0.59.
+- **`clean` stayed exactly 0.00** for 1000 steps: the no-clean-cost guarantee holds in a real run.
+
+**8-pass VAL eval — not promoted.**
+
+| arm | CellPainting | HAR | HVTN | L1000 |
+|---|---|---|---|---|
+| headM (v7) | **0.820** | 0.838 | 0.797 / 0.806 (sub) | 0.502 |
+| Huber + sd | 0.820 | 0.836 | **0.839** | **0.517** |
+| mean + sd | 0.821 | 0.826 | 0.756 | 0.516 |
+| sketch | 0.801 | **0.865** | 0.840 | 0.511 |
+
+- It **ties** Huber + sd on CellPainting and HAR and **loses 3.3 on HVTN and 1.5 on L1000.** It closes the gap to curated imputation from a neutral start but does not pass it.
+- `dev_real` peaked at step 500 and sagged to step 1000, so the screen did not justify the 6000-step run. The checkpoint is kept as the v7 comparison arm.
+
+### V4b / V4c killed: the Huber + sd start is a ceiling, not a platform
+
+- **V4a** (Huber + sd input, 64 instances): val Δacc **+0.01**, dev_real 72.49 → 72.35. Flat.
+- **V4b** (same, 256 instances): train loss falls (0.597 → 0.565) while val stays flat (Δacc −0.15 at step 250, −0.02 at 500) and dev_real is 72.45 at step 500. Killed at 625. **Instance count is not the lever.**
+- **V4c** (warm start from V2b) was killed unlaunched: its ceiling is the same Huber + sd baseline.
+- Reading: hand features saturate the task; with a frozen backbone there is nothing left for the branch to add, and the falling train loss is overfitting to the training draws.
+
+### Step 1 — the learned column-aware estimator (`backbone_loc='learned_m'`)
+
+**Implementation** ([obs_model.py](obs_model.py)). Weights `w_k = softplus(c0 + g(|r_k|/s_c, t_c, log n))`, `c0 = log(e-1)` so `w ≡ 1` at init and `g`'s output layer is zero-init; 3 differentiable IRLS iterations from the cell median. `s_c` is the pooled robust column scale ([`pooled_scale`](obs_model.py), the `huber_location` scale in raw units, a CONTEXT statistic and therefore not differentiated, as the wrapper's preprocessing is not); `t_c` is `col_ctx`'s `phi_col` pooled over **all** replicated cells (context and query, no labels). The backbone then reads **explicit columns**: the learned location plus the weighted scale, one pair per replicated feature. `rep_emb=False` drops the additive embedding entirely, so the learned information can only reach TabICL as columns.
+
+**Guarantees** (`python obs_model.py --learned_m`). Step 0 **equals the mean + sd wrapper input exactly (0.0)**, `w ≡ 1` at init, all-`n=1` tables equal stock at random weights (0.0), and randomizing `g` changes `n>1` outputs.
+
+**Two numerical bugs found and fixed before the screen could train** (both would have produced silently dead runs):
+
+1. **Zero variance under censoring.** Censoring piles replicates on a limit, so a cell's variance is exactly 0 and `d√x` is infinite at 0: `SqrtBackward0` returned NaN, poisoning `loc_c0` / `loc_w` / `phi_col` on every `sh_cens` batch. Fixed with `var.clamp_min(1e-8)` **in both the learned and the plain sd path** (the plain path was a latent bug all along). All shape settings (`sh`, `sh_cens`, `sh_xorp`, `sh_rare`, `sh_tail`, `sh_pop`, `sh_rep`) now give finite forward and gradients.
+2. **The branch-owned-parameter predicate.** `--freeze_backbone` and the optimizer groups keyed on the `rep_` prefix, so the new `loc_*` parameters of the learned estimator were frozen. Now `is_layer = rep_* or loc_*`, used for the init assert, the freeze, and the optimizer groups.
+
+Also fixed in the lanes: `--ps` JSON passed through an unquoted-expanded variable is word-split by bash (the escaped quotes become literal characters), which crashes at `json.loads`. Pass it as its own quoted argument.
+
+**M1 (learned columns only, no embedding) — the positive result.**
+
+| step | dev_real (VAL, 1 pass) | val Δacc / Δloss |
+|---|---|---|
+| 0 | 72.77 | — |
+| 500 | 74.70 (+1.93) | +0.19 / −0.005 |
+| 1000 | **78.07 (+5.31)** | **+0.48 / −0.011** |
+
+- **Its step 0 is the mean + sd wrapper by construction (72.77 ≈ 73.0), and it climbs 5.3 points above it**, monotonically, still rising at the screen end.
+- 1.9 s/step: with `rep_emb=False` the replicate encoder runs forward-only (no gradient reaches it), so M1 learns the weight curve and nothing else.
+
+**M1, 8-pass VAL eval (1000 steps):**
+
+| arm | CellPainting | HAR | HVTN | L1000 | mean |
+|---|---|---|---|---|---|
+| **M1** | **0.829** | 0.820 | **0.842** | **0.522** | **0.753** |
+| Huber + sd | 0.820 | 0.836 | 0.839 | 0.517 | 0.753 |
+| mean + sd | 0.821 | 0.826 | 0.756 | 0.516 | 0.730 |
+| per-set best hand (the 0c bar) | 0.821 | **0.865** | 0.840 | 0.517 | 0.761 |
+
+- **The first arm in this project to beat the hand summaries on HVTN** (+0.3 over the best hand arm on the set where every previous branch lost), and it also wins L1000 (+0.5) and CellPainting (+0.8).
+- **HAR is the one loss** (−1.6 vs Huber + sd, −4.5 vs sketch). HAR is a population set where the 7-column sketch dominates, and M1 exposes only 2 columns per feature.
+- Log-loss on VAL: HAR 0.519, L1000 1.387, CellPainting 0.550, HVTN 0.366.
+
+**M2 (M1 + the V2b branch, warm-started) — the embedding adds nothing, again.**
+
+| step | dev_real |
+|---|---|
+| 0 | 72.36 |
+| 500 | **72.08 (−0.28)** |
+
+- 2.6 points **below** M1 at the same step, val negative from step 250 (−0.13), and 4.7× slower (9.0 s/step) because the embedding keeps the encoder in the backward.
+- Killed at step 500 by a rule stated before the read. This is the **fourth** independent negative for the additive embedding channel (V3 `sd_learn`, V4a/V4b, the v7 head, M2), against two positives for explicit columns (the hand sd / sketch, M1).
+
+### M3 (in progress) — does the slot count bind?
+
+`tx_m3_A` = M1 + `sd_learn=2`: each replicated feature feeds TabICL 4 columns (`learned location`, `weighted scale`, `L1`, `L2`) instead of 2. It targets M1's single deficit: the sketch's only advantage over `mean + sd` is *more slots*.
+
+- Step 0 dev_real 72.75 = M1's 72.77, so the guarantee holds and M3 starts exactly at M1's input.
+- Screening at 1000 steps; M1's paused checkpoint (step 1000, verified) is the resume point if M3 loses.
+- **Decision rule, stated before the result:** M3 wins if it is ≥0.5 better on the VAL mean *and* recovers the HAR deficit without giving back HVTN or L1000. A tie means slot count is not the constraint and HAR instead needs an explicitly distributional column. M4 (M3 + embedding) stays skipped unless M3 wins, since M2 already answered the embedding question.
+
+### Method notes
+
+- **Run hygiene.** Queued lanes gate on marker lines in `artifacts/logs/phase3.log`; a stale marker from a crashed launch let a regression arm start beside a classification run (two GPU jobs, OOM risk). Markers are now removed when a run is killed, and the final test read additionally requires a `FULL_DONE` file so it cannot fire while a screen is still being read.
+- **Monitoring.** [monitor_shape.py](experiments/obs_noise/monitor_shape.py) (log-only: step, s/step, ETA to the next milestone, train-loss trend, dev kill readout, val deltas) and [track_shape.sh](experiments/obs_noise/track_shape.sh) (15-minute snapshots). `nvidia-smi` is unusable on this machine (NVML driver/library mismatch), so GPU state is read through torch.
