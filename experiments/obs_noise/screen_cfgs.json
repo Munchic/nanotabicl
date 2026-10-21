@@ -1,0 +1,3 @@
+{"tx_scr_gate10_A": {"center": "attn_medg", "med_feat": true, "std": "medmad", "zclip": 10.0, "robust_feats": true, "dist_emb": true, "temp_head": true, "col_ctx": true, "_args": {"gate_lr_mult": 10.0}},
+ "tx_scr_cap_A": {"center": "attn_medg", "med_feat": true, "std": "medmad", "zclip": 10.0, "robust_feats": true, "dist_emb": true, "temp_head": true, "col_ctx": true, "d_s": 64, "n_sab": 2},
+ "tx_scr_tok_A": {"center": "attn_medg", "med_feat": true, "std": "medmad", "zclip": 10.0, "robust_feats": true, "dist_emb": true, "temp_head": true, "col_ctx": true, "col_tok": 4}}

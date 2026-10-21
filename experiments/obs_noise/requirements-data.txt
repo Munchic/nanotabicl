@@ -1,0 +1,6 @@
+# data generation + report (gen_data.py, data_report.py, analyze.py): conda env 'ml', python 3.13.12
+matplotlib==3.10.8
+numpy==2.3.5
+torch==2.10.0+cu128
+scikit-learn==1.8.0
+scipy==1.17.1
