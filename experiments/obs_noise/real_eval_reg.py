@@ -26,9 +26,29 @@ def tasks(datasets):
             yield ds, os.path.basename(f)[:-4], z, tr, te, y
 
 
+def reg_reliability(q, y, z, tr, te):
+    """Regression analogue of calib_rel: per tertile of the row's instance count and spread (calib_rel.row_reliability),
+    90% interval coverage, mean 90% width and median |error| of the median; plus the Spearman correlation between the
+    predicted 90% width and |error| (> 0: uncertainty tracks error)."""
+    from scipy.stats import spearmanr
+    from calib_rel import row_reliability
+    from reg_metrics import interval
+    lo, hi = interval(q, 0.9)
+    err = np.abs(np.sort(q, 1)[:, q.shape[1] // 2] - y)
+    width, cov = hi - lo, (y >= lo) & (y <= hi)
+    reps = np.where(np.isfinite(z['replicates']), z['replicates'], np.nan)
+    logn, spread = row_reliability(reps, np.isfinite(reps).sum(-1), tr, te)
+    out = dict(width_err_spearman=float(spearmanr(width, err)[0]))
+    for nm, key in (('by_n', logn), ('by_spread', spread)):
+        b = np.digitize(key, np.quantile(key, [1 / 3, 2 / 3]))
+        out[nm] = [dict(bin=int(i), n=int((b == i).sum()), cov90=float(cov[b == i].mean()), width90=float(width[b == i].mean()),
+                        med_abs_err=float(np.median(err[b == i]))) for i in range(3) if (b == i).any()]
+    return out
+
+
 def mean_input(z, k):
-    counts = z['counts'].astype(np.int64) if k == 'all' else np.minimum(z['counts'], int(k)).astype(np.int64)
-    mask = np.arange(z['replicates'].shape[-1])[None, None] < counts[..., None]
+    fin = np.isfinite(z['replicates'])
+    mask = fin if k == 'all' else fin & (np.cumsum(fin, -1) <= int(k))
     with np.errstate(all='ignore'):
         return np.nanmean(np.where(mask, np.nan_to_num(z['replicates']), np.nan), -1)
 
@@ -53,10 +73,11 @@ def run_ckpts(specs, datasets, ks, n_ens):
             order = np.concatenate([tr, te])
             y_in = torch.tensor(y[tr], dtype=torch.float32, device='cuda')[None]
             for k in ks:
+                pkw = dict(paired=torch.tensor([bool(z['paired'])], device='cuda')) if (ck['mode'] == 'obs' and 'paired' in z.files) else {}
                 with torch.no_grad():
-                    q = obs_eval.ens_predict(model, task_inputs(z, ck['mode'], k, order, 'cuda'), y_in, ck['mode'], 'regression', None, n_ens)
+                    q = obs_eval.ens_predict(model, task_inputs(z, ck['mode'], k, order, 'cuda'), y_in, ck['mode'], 'regression', None, n_ens, **pkw)
                 m, _ = reg_metrics(q, y[te])
-                recs.append(dict(model=tag, dataset=ds, task=task, k=k, n_ens=n_ens, **m))
+                recs.append(dict(model=tag, dataset=ds, task=task, k=k, n_ens=n_ens, **m, rel=reg_reliability(q, y[te], z, tr, te)))
             torch.cuda.empty_cache()
         print_summary(recs, tag, datasets, ks)
     return recs
@@ -72,7 +93,7 @@ def run_wrapper(datasets, ks, n_ens):
             reg = TabICLRegressor(random_state=0, device='cuda', n_estimators=n_ens).fit(X[tr], y[tr])
             q = np.asarray(reg.predict(X[te], output_type='quantiles', alphas=list(TAUS)))
             m, _ = reg_metrics(q, y[te])
-            recs.append(dict(model=tag, dataset=ds, task=task, k=k, n_ens=n_ens, **m))
+            recs.append(dict(model=tag, dataset=ds, task=task, k=k, n_ens=n_ens, **m, rel=reg_reliability(q, y[te], z, tr, te)))
     print_summary(recs, tag, datasets, ks)
     return recs
 
@@ -92,7 +113,9 @@ if __name__ == '__main__':
     ap.add_argument('--ks', default='1,all')
     ap.add_argument('--n_ens', type=int, default=1)
     ap.add_argument('--out', default=os.path.join(ROOT, 'artifacts', 'real_eval_reg.jsonl'))
+    ap.add_argument('--allow_test', action='store_true', help='one final read of dev/test sets (devsplit.py)')
     a = ap.parse_args()
+    import devsplit; devsplit.guard([d.split(':')[0] for d in a.datasets.split(',')], a.allow_test)
     ks = [k if k == 'all' else int(k) for k in a.ks.split(',')]
     ds = a.datasets.split(',')
     recs = run_wrapper(ds, ks, a.n_ens) if a.wrapper else run_ckpts(a.ckpts, ds, ks, a.n_ens)

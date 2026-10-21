@@ -90,7 +90,7 @@ def permute_cols(inp, perm, mode):  # column permutation of every input tensor (
     return [a.unflatten(-1, (-1, 6))[:, :, perm].flatten(-2) if mode == 'stats' else a[:, :, perm] for a in inp]
 
 
-def ens_predict(model, inp, y_in, mode, task, k, n_ens):
+def ens_predict(model, inp, y_in, mode, task, k, n_ens, **kw):
     """-> probabilities (T, k) or sorted quantiles (T, NQ), averaged over n_ens members (n_ens = 1: one plain pass)."""
     n_cols = inp[0].shape[2] // (6 if mode == 'stats' else 1)
     acc = 0.0
@@ -99,7 +99,7 @@ def ens_predict(model, inp, y_in, mode, task, k, n_ens):
         shift = 0 if task == 'regression' else i % k
         x = permute_cols(inp, torch.tensor(perm, device=inp[0].device), mode)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=not FP32):
-            logits = model(*x, y_in if shift == 0 else (y_in + shift) % k)
+            logits = model(*x, y_in if shift == 0 else (y_in + shift) % k, **kw)
         if task == 'regression':  # a 999-quantile head (TabICLv2, levels k / 1000) -> our 99 levels k / 100
             q = np.sort(logits[0].float().cpu().numpy(), 1)
             acc = acc + (q[:, 9::10] if q.shape[1] == 999 else q)

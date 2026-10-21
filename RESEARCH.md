@@ -2023,3 +2023,239 @@ LINCS dose split (dev):
 - **Runs** ([lane13.sh](experiments/obs_noise/lane13.sh)). The v5 prior and settings of `tx_v5gen_A`, generic branch (center attn), d_s 64 + 2 SAB, frozen TabICLv2 regression backbone, 4000 steps.
   - `tx_v5reg_ra_A` (+ `row_attn`) vs `tx_v5reg_A` (control).
   - Then real regression (dev + GasConc, Tox21Pot) and the 27 synthetic sets, at 1 and 8 passes.
+
+## Shape features: does the replicate set carry signal beyond its mean? (training-free, 2026-10-20)
+
+- **Setup** ([shape_features.py](experiments/obs_noise/shape_features.py), [shape_summary.py](experiments/obs_noise/shape_summary.py)). The off-the-shelf wrapper, all replicates. Per cell it gets the mean (baseline), mean + sd, a sketch (mean, median, sd, q25, q75, min, max), or the sketch + log n. Δ is paired per task vs mean only.
+- **8 estimators** (classification: points; regression: CRPS, lower is better):
+
+| dataset | mean | + sd | sketch | best trained branch (`tx_v5gen_A` / stage A reg, 8) |
+|---|---|---|---|---|
+| L1000 dose, acc | 50.7 | **+1.0 ± 0.3 (4/5)** | +0.3 ± 1.2 | +0.2 ± 1.2 |
+| Cell Painting dose, acc | 80.6 | **+1.5 ± 0.7 (4/5)** | −0.2 ± 1.5 | +0.9 ± 0.6 |
+| GasDrift, acc | 80.1 | +2.9 ± 2.0 (4/9; 1 est.: +5.4 ± 2.3) | +0.6 ± 1.4 | −1.1 ± 0.7 |
+| Tox21, AUC | 90.1 | +0.0 ± 0.1 | +0.3 ± 0.2 | 0.0 ± 0.3 |
+| UPS1_low, AUC | 95.8 | +0.3 ± 0.1 | **+0.8 ± 0.3 (9/10)** | 0.0 ± 0.3 |
+| CPTAC, AUC | 89.8 | **+4.0 ± 0.6 (10/10)** | +3.3 ± 0.4 (10/10) | +1.3 ± 0.4 |
+| Cell Painting dose reg, CRPS | 0.432 | +0.021 (0/5, worse) | +0.030 (worse) | +0.013 (worse) |
+| GasConc / Tox21Pot, CRPS | 0.038 / 0.433 | 0.000 / +0.002 | 0.000 / 0.000 | +0.001 / −0.005 |
+
+- **In classification the replicate spread is label signal on most datasets**, and the hand feature beats every trained branch.
+  - On CPTAC it is +4.0 AUC (10/10) vs the trained branch's +1.3. There, high within-cell spread marks censoring / floor substitution, which is far more frequent for the spiked UPS proteins (28% vs 6.5% of cells).
+  - LINCS gains +1.0 / +1.5 with sd; UPS1_low gains +0.8 with the sketch.
+- **Regression gets nothing, and Cell Painting dose regression gets worse.** The extra columns hurt the small dose-level tasks.
+- **Implications.**
+  1. "Mean + sd → wrapper" is a strong, free baseline that the replicate branch must beat; it currently does not. The branch has the spread, but it reaches the frozen backbone only through an additive embedding, apparently less usable than an explicit column.
+  2. This supports the distribution-as-signal direction: shape matters even with 2–6 replicates.
+  3. **Caveat:** this used the held-out sets for a training-free comparison. Any feature design chosen from it must be validated on new data.
+
+**Exp 11 step 2 result: both regression runs were killed at step 500 on Cell Painting dose (dev).**
+- CRPS: `tx_v5reg_ra_A` (+ row_attn) 0.428 → 0.453; the control `tx_v5reg_A` 0.428 → 0.464.
+- Row attention is not the cause; it was slightly better than the control.
+- The learned branch on the v5 prior does not transfer in regression either. The same holds for the hand shape features (+0.021 to +0.030), so the extra replicate information itself appears to confuse the dose-level regression.
+- Step 3 (oversampling) is not started: step 2 did not pass.
+
+## Shape learning (SHAPE.md), day 0 progress (2026-10-20)
+
+**Prior headroom** ([shape_headroom.py](experiments/obs_noise/shape_headroom.py); TabICLv2 fp32, 4 held-out blocks). Each entry is the share of the mean → oracle loss gap closed with no training. Oracle accuracy is 0.801 in every setting.
+
+| setting | mean acc | + sd | sketch |
+|---|---|---|---|
+| location | 0.736 | 1% | 7% |
+| scale | 0.596 | 43% | 50% |
+| mixture share | 0.627 | 12% | 27% |
+| rare subpopulation | 0.569 | 11% | 13% |
+| mode separation | 0.582 | 47% | 56% |
+| tail | 0.580 | 19% | 19% |
+| paired state | 0.680 | 2% | 5% |
+| paired XOR | 0.665 | 4% | 8% |
+| replicate-sized sets | 0.643 | 3% | 4% |
+| population-sized sets | 0.688 | 17% | 28% |
+
+- No setting is solved by the sketch, and none is pure noise, so the family shares are kept as designed.
+- The paired settings are where hand features help least: that is the case for the joint path.
+
+**New data.**
+- HAR (dev, 5 subject-disjoint splits).
+- Musk (final; 102 molecules).
+- PhysioNet 2012 set-a (final; 4000 stays, 554 deaths, 41 columns, 26% n = 0 cells).
+- Zenodo 6546964 cytometry: NK and MS verified; HVTN and preeclampsia re-downloading (checksum mismatch).
+
+**HAR dev baselines (wrapper, 8 est.).**
+
+| arm | accuracy | log-loss | overconfidence, high-spread rows | overconfidence, low-spread rows |
+|---|---|---|---|---|
+| mean | 73.1 | 0.851 | +0.149 | +0.056 |
+| mean + sd | 82.6 | 0.567 | +0.171 | +0.043 |
+| sketch | 86.5 | 0.439 | +0.127 | +0.038 |
+| cluster shares | 83.7 | 0.539 | +0.097 | +0.076 |
+
+- The wrapper is most overconfident on its most spread-out rows, which is the reliability failure to fix ([calib_rel.py](experiments/obs_noise/calib_rel.py), [calib_summary.py](experiments/obs_noise/calib_summary.py)).
+- LINCS dose is underconfident or roughly calibrated in every bin.
+
+**Model.**
+- ISAB encoder (`isab`, linear in K).
+- Per-cell replicate-sd columns (`sd_cols`; step 0 = the mean + sd input).
+- Encoder chunked over cells with per-chunk checkpointing: identical to one call (outputs 3e-7, gradients 9e-7), and it fixes the population-size OOM.
+- Self-tests pass.
+
+**Screen pair 1 running** ([lane_shape1.sh](experiments/obs_noise/lane_shape1.sh)): V0 (mean) vs V1 (+ sd columns), with the dev kill on HAR + LINCS dose and the learning kill at step 1000.
+
+**Robust location / scale pairs (wrapper, 8 est., CPU; paired vs the mean; [shape_features.py](experiments/obs_noise/shape_features.py) arms).**
+
+| dataset | mean + sd | Huber + sd | median + 1.4826 MAD | Huber + MAD |
+|---|---|---|---|---|
+| HAR | +9.6 | **+10.5** | +8.6 | +9.1 |
+| L1000 dose | +1.0 | **+1.1** | −7.5 | −0.2 |
+| Cell Painting dose | **+1.5** | +1.4 | −7.7 | −0.9 |
+| CPTAC, AUC | **+4.0** | +3.7 | +2.6 | +3.1 |
+| UPS1_low, AUC | +0.3 | −0.0 | −2.9 | **+1.0 (10/10)** |
+| Tox21, AUC | +0.0 | +0.1 | −0.2 | −0.2 |
+| GasDrift | +2.9 | +2.8 | +0.8 | +2.1 |
+
+- **Huber + sd is a slight overall improvement on mean + sd.**
+  - It has the best log-loss on 4 of 7 sets (HAR 0.514 vs 0.567; L1000 1.378; Cell Painting 0.543; Tox21).
+  - It has the best confidence-error AUROC on HAR (0.842).
+  - It costs a little on proteomics.
+- **The median-based pairs fail with 2–6 replicates,** the same lesson as median imputation.
+- **No pair fixes HAR's overconfidence on high-spread rows** (about +0.15). That is left for the learned branch.
+- **Candidate variant:** the backbone sees Huber + sd at step 0 (a different summary function, not a new mechanism), to try if V1 passes the screen.
+
+**Screen V0 (shape prior, backbone sees the mean, ISAB marginal encoder) passed both kill switches.**
+- Dev (HAR + LINCS dose, mean accuracy over 15 tasks): 67.7 → 71.9 (step 500) → 72.2 (step 1000).
+- Learning check: shape-only settings' gap closed 0.040 → 0.277 (≥ +0.10 required).
+
+Per dev dataset at step 1000, 1 pass; the wrapper at 1 est.:
+
+| | V0 | wrapper mean | mean + sd | sketch |
+|---|---|---|---|---|
+| HAR acc / log-loss | **83.2 / 0.501** | 72.3 / 0.873 | 82.0 / 0.591 | 86.0 / 0.498 |
+| HAR overconfidence, high-spread tertile | **+0.109** | +0.149 (8 est.) | +0.171 (8 est.) | +0.127 (8 est.) |
+| L1000 dose acc | **52.3** | 50.3 | 51.6 (8 est.) | |
+| Cell Painting dose acc | **81.1** | 80.3 | 82.1 (8 est.) | |
+
+- **The first trained branch with a real gain on L1000:** +2.0 over the wrapper. The best earlier was `tx_v5gen_A` at 50.2.
+- On HAR, the branch learned roughly what hand-built shape features give, from synthetic data alone, and it is the least overconfident arm on spread-out rows.
+- Synthetic at step 1000 ≈ the sketch per family (scale 0.698 vs 0.699, mode separation 0.702 vs 0.705, mix 0.674 vs 0.675). Joint settings stay below the sketch (XOR 0.665 vs 0.676, state 0.675 vs 0.686); that is the target of V2.
+- The screen continues sequentially (V1 → V2 → V3) after V1 hit OOM next to V0.
+
+**Screen V1 (+ sd columns).**
+- Dev 71.6 → 72.1 → 72.5.
+- Learning check: 0.244 → 0.276, i.e. **+0.03 < 0.10 → fails the rule as stated.**
+- On synthetic at step 1000, V1 = V0 (sh loss 0.740 vs 0.742; every family within ±0.004). The sd columns give V1's start what V0 learns; the learned part then adds little on top.
+
+| dev, 1 pass, step 1000 | V0 | V1 |
+|---|---|---|
+| HAR acc / log-loss / confidence AUROC | 83.2 / 0.501 / 0.806 | **84.7 / 0.424 / 0.850** |
+| HAR overconfidence, high-spread tertile | **+0.109** | +0.133 |
+| L1000 acc / log-loss | **52.3** / 1.420 | 50.9 / 1.418 |
+| Cell Painting acc / log-loss | 81.1 / 0.618 | **81.7 / 0.590** |
+
+- **V1 has the best log-loss on all three dev sets.** Its HAR log-loss of 0.424 is better than the best hand-feature wrapper (sketch: 0.498 at 1 est.).
+- V0 is better on L1000 accuracy and on HAR's high-spread calibration.
+- **The learning rule is mis-specified for sd-column variants.** Their step 0 already closes 24% of the gap, so "+0.10 over step 0" measures the head start, not whether the architecture learns. V1's verdict is recorded as is.
+- **For V2 / V3 (same start as V1):** learning is judged against V1's step-1000 value (0.276), not against their own step 0, stated before their results.
+
+**Screen V2 (V1 + joint path, width 16).**
+- Dev 71.6 → 72.0 → 72.3. Learning 0.244 → 0.272 (vs V1's 0.276: no gain).
+- The joint settings are unchanged vs V1: sh_xor 0.663 / 0.799 vs 0.664 / 0.798; sh_state 0.673 vs 0.674.
+- The joint path did train (output map norm 0 → 0.46). **The prior gave it little to learn.** The original XOR tables code a single column pair with one projection of x, and the other columns carry marginal signal, so sh_xor's mean → sketch → oracle is 0.665 → 0.676 → 0.801 (mostly ordinary noise).
+- **Prior fix (option `xor_pairs`, validation `sh_xorp`).** Every column pair of an XOR table is XOR-coded: pair j carries column 2j's u through the share of anti-correlated instances, and every marginal is uninformative.
+  - Headroom: mean 0.589, + sd 0.604, sketch 0.618 (10% of the gap), oracle 0.801. That leaves a large joint-only gap.
+- **Matched pair queued after V3** ([lane_shape_xorp.sh](experiments/obs_noise/lane_shape_xorp.sh)): V1b (sd columns) vs V2b (+ joint), both on the xor_pairs prior. The learning check includes sh_xorp.
+
+**Screen V3 (learned sd column).** Dev 72.4 / 72.2; learning 0.270 (V1: 0.276). No gain: all four marginal variants (V0–V3) end at the same synthetic level by step 1000.
+
+**Final-evaluation cytometry sets built** ([real_data_sets.py](experiments/obs_noise/real_data_sets.py); sizes and labels only, no metrics). Each takes 1024 cells per sample, so rare responder populations are not lost; technical / scatter / viability channels are dropped. Splits are 20 seeded label-stratified halves, grouped by subject.
+
+| dataset | samples | labels | groups | markers |
+|---|---|---|---|---|
+| NK CyTOF (CMV status) | 20 | 11 / 9 | 20 (one per donor) | 37 |
+| HVTN flow (ENV vs GAG stimulation; 48 subjects × 2, grouped by subject) | 96 | 48 / 48 | 48 | 7 |
+| Preeclampsia CyTOF (23 patients, mostly 2 samples, grouped) | 45 | 22 / 23 | 23 | 33 |
+
+- MS scRNA-seq is dropped: 8 patients, decided on size alone.
+
+**Matched pair on the xor_pairs prior (step 1000).**
+
+| | V1b (sd columns) | V2b (+ joint path) |
+|---|---|---|
+| sh_xorp acc / loss (step 0: 0.620 / 0.892; sketch 0.618) | 0.624 / 0.884 | **0.644 / 0.837** |
+| gap closed (learning check) | 0.298 | **0.324** |
+| HAR acc / log-loss / overconfidence, high-spread tertile | 85.2 / 0.407 / +0.127 | **86.9 / 0.374 / +0.100** |
+| L1000 dose acc: as evaluated (unpaired) / with `paired` | 50.5 / 50.5 | 49.2 / **51.5** |
+| Cell Painting dose acc: unpaired / paired | **82.3** / 82.3 | 79.9 / 80.9 |
+| dev (HAR + LINCS, kill switch) | 72.7 | 72.0 |
+
+- **The joint path learns joint-only signal beyond the hand sketch** (sh_xorp 0.644 vs sketch 0.618). V2b is the best of all arms on HAR, wrappers included (sketch: 86.0 / 0.498), and the best calibrated on spread-out windows.
+- The LINCS dose tasks were not marked paired, so the joint path was off there. **They are now marked paired** (`paired = True` added to the LINCS npz files: a well is measured on every feature). With the flag, V2b's L1000 is 51.5; Cell Painting remains 1.4 below V1b.
+- Run-to-run variation on LINCS between identical architectures is about ±1 (V1 vs V1b).
+- **Selection: V2b** (highest gap closed, the plan's criterion; best on paired dev).
+  - Full run: resumed from step 1000 to 6000 ([lane_shape_full.sh](experiments/obs_noise/lane_shape_full.sh)).
+  - **Note:** dev values from step 1500 on include paired LINCS, so they are not strictly comparable with the logged steps 0 / 500 / 1000.
+  - The kill window has passed; dev is monitored by hand, and Cell Painting is the thing to watch.
+
+**`tx_shV2b_A` final (6000 steps).**
+- Dev 72.4–73.5 throughout steps 1500–6000 (73.1 re-scored at 1000, 72.9 at 6000): no drift.
+- Synthetic at 6000: sh loss 0.735 (step 0: 0.749); sh_xorp 0.651 / 0.821 (sketch 0.618); modesep 0.699; mix 0.771.
+
+Dev, 8 passes vs the wrapper at 8 est.:
+
+| | V2b | mean | mean + sd | Huber + sd | sketch |
+|---|---|---|---|---|---|
+| HAR acc / log-loss / overconfidence, high-spread tertile | 86.1 / **0.388** / **+0.096** | 73.1 / 0.851 / +0.149 | 82.6 / 0.567 / +0.171 | 83.6 / 0.514 / +0.150 | **86.5** / 0.439 / +0.127 |
+| L1000 acc / log-loss | **52.5** / 1.391 | 50.7 / 1.424 | 51.6 / 1.393 | 51.7 / **1.378** | 51.0 / 1.437 |
+| Cell Painting acc / log-loss | **82.9** / 0.571 | 80.6 / 0.588 | 82.1 / 0.546 | 82.0 / **0.543** | 80.4 / 0.673 |
+
+- V2b has the best accuracy on both LINCS sets, and the best log-loss and high-spread calibration on HAR.
+- It is underconfident on LINCS (overconfidence −0.06 to −0.08), which costs it log-loss there.
+- The final held-out evaluation is running ([final_shape_eval.sh](experiments/obs_noise/final_shape_eval.sh)).
+
+## Shape learning: final evaluation of `tx_shV2b_A` (2026-10-21; SHAPE.md section 7, run once)
+
+AUC, paired vs the mean + sd wrapper (8 est.), 8 passes:
+
+| dataset | V2b | joint path off | Huber + sd | sketch | cluster shares |
+|---|---|---|---|---|---|
+| NK (20 donors) | +0.2 ± 2.3 | +1.0 | **+8.0 ± 2.5** | −1.0 | +2.5 |
+| HVTN | +3.1 ± 0.9 (17/20) | +1.0 | **+8.4 ± 1.3** | +8.3 | −5.6 |
+| Preeclampsia | +0.2 ± 1.5 | −0.9 | +1.0 | **+3.9** | +2.2 |
+| Musk | **+1.2 ± 1.6** | +0.4 | −0.4 | −1.0 | −2.4 |
+| PhysioNet | −0.5 ± 0.3 | −0.5 | 0.0 | **+0.4** | n/a |
+
+- **The primary criterion is not met:** V2b beats mean + sd by more than 2 SE on 1 of 5 datasets (HVTN), and is not significantly worse on any.
+- **Secondary bar (Huber + sd):** V2b is worse on NK −7.8 ± 2.7, HVTN −5.3 ± 1.2 and PhysioNet −0.5 ± 0.1; tied on PreE −0.8 ± 1.7 and Musk +1.6 ± 1.6.
+- **vs cluster shares:** HVTN +8.7 ± 2.0, Musk +3.7 ± 1.0, NK −2.2 ± 2.7, PreE −1.9 ± 1.5.
+- **Robust location is the missing signal on cytometry.** Mean + sd → Huber + sd is +8 AUC on NK and HVTN: markers are multimodal (cell types), so the mean is a poor summary. The backbone sees the mean, and the embedding does not carry robust location strongly enough. This is the explicit-column lesson again.
+- **The joint path helps where expected:** vs off, HVTN +2.1, Musk +0.8, PreE +1.1; NK −0.8.
+- **HVTN gains a lot from 8 passes** (87.1 vs 80.8 at 1 pass). That suggests a sensitivity to column order or a set-size mismatch: 64 instances in training vs 1024 in evaluation.
+- **Calibration:**
+  - NK: V2b is near-calibrated on high-spread rows (−0.006 vs mean + sd +0.044).
+  - HVTN: underconfident (−0.09).
+  - PreE: every arm is about +0.3 overconfident, at near-chance AUC (56–61).
+  - PhysioNet: about calibrated.
+- **These five datasets are now dev** (looked at). A later final test needs fresh held-out data.
+- **Next** (user-approved): (1) the backbone sees Huber + sd columns (step 0 = the Huber + sd wrapper); (2) training on 256 instances per cell, with test-time subsample averaging.
+
+## Shape learning, round 2 (dev now includes the five former final sets)
+
+**V2b + test-time subsample averaging** (4 × 256 instances, no training). NK 67.8 → 66.0, HVTN 87.1 → 83.1, PreE 57.6 → 59.1; Musk and PhysioNet unchanged (sets ≤ 256). More instances help; averaging smaller subsamples loses the rare cells. **Dropped as a default.**
+
+**V4a (backbone sees Huber + sd; joint path; 64 instances; 1000 steps).** Dev kill switch passed (72.5 → 72.9 → 72.4).
+
+| dataset | V4a vs the Huber + sd wrapper (8 est.) | V2b → V4a |
+|---|---|---|
+| HAR acc | +0.1 ± 0.2 | 86.1 → 83.8 |
+| L1000 acc | **+1.2 ± 0.6** | 52.5 → 53.0 |
+| Cell Painting acc | +0.5 ± 0.4 | 82.9 → 82.5 |
+| NK AUC | −3.0 ± 1.4 | 67.8 → 72.5 |
+| HVTN AUC | 0.0 ± 0.3 | 87.1 → 92.5 |
+| PreE AUC | −0.5 ± 1.0 | 57.6 → 57.9 |
+| Musk AUC | +1.0 ± 1.0 | 85.2 → 84.6 |
+| PhysioNet AUC | **+0.3 ± 0.1** | 84.2 → 85.0 |
+
+- **V4a ≈ the Huber + sd wrapper.** It recovers the cytometry gap but loses V2b's learned HAR gain.
+- **The branch added almost nothing in 1000 steps:** synthetic sh loss 0.742 → 0.743, sh_xorp 0.887 → 0.889, learning check 0.289 → 0.289.
+  - The weights did train, with no skipped steps.
+  - V2b's joint learning switched on between steps 500 and 750 (sh_xorp 0.888 → 0.852); V4a's has not by step 1000. This looks like a variable-onset learning phase.
+- **Queued after V4b:** V4c, the V4 configuration warm-started from V2b's trained branch (lr 1e-4, 1000 steps), to keep the learned joint / HAR gains while the backbone sees Huber + sd. `--init` now loads checkpoints with `weights_only=False`.
