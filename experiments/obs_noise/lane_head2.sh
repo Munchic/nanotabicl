@@ -6,11 +6,12 @@ cd "$(dirname "$0")"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 PY=/home/munchic/miniconda3/envs/ml/bin/python
 VPY=/tmp/claude-1002/-home-munchic-nanotabicl/b53eb5b4-8334-4c18-b331-49e90dd4cfcf/scratchpad/venv/bin/python
+PSJ='{"xor_pairs":true}'
 PSV='{"p_lod":0.6,"p_cens_r":0.4,"p_mcar":0.3,"p_well":0.4,"p_plate":0.3,"p_fail":0.25,"sub":1,"p_spec":0.6,"xor":0.3}'
 VN=v7,v7_clean,v7_tail,v7_xorp,v7_cens,v7_mnar,v7_well,v7_meas
 VAL=HAR,L1000_dose,CellPainting_dose,HVTN
-base='"center": "attn", "med_feat": true, "std": "medmad", "zclip": 10.0, "robust_feats": true, "dist_emb": true, "temp_head": true, "col_ctx": true, "d_s": 64, "n_sab": 2, "isab": 16, "joint": 16, "flag_emb": true, "miss_emb": true'
-COM="--mode obs --freeze_backbone --arch tabicl --batch_size 32 --micro_batch 2 --warmup 200 --noise_set v7 --ps $PSV --val_every 250 --val_blocks 4 --log_every 25 --dev_every 500 --dev_kill_margin 0.5 --dev_kill_until 1000"
+base='"center": "mean", "med_feat": true, "std": "medmad", "zclip": 10.0, "robust_feats": true, "dist_emb": true, "temp_head": true, "col_ctx": true, "d_s": 64, "n_sab": 2, "isab": 16, "sd_cols": true, "backbone_loc": "learned_m", "rep_emb": false'
+COM="--mode obs --freeze_backbone --arch tabicl --batch_size 32 --micro_batch 2 --warmup 200 --noise_set shape --val_every 250 --val_blocks 4 --log_every 25 --dev_every 500 --dev_kill_margin 0.5 --dev_kill_until 1000"
 
 # 1. VAL references (CPU only, no GPU wait)
 if [ -s artifacts/val_ref.jsonl ]; then
@@ -25,9 +26,9 @@ else
 fi
 
 # 2. Same v7 head in regression (Beijing dev; CRPS / PIT). Screen only.
-until grep -q "tx_headM_A val-evaluated" artifacts/logs/phase3.log; do sleep 120; done
+until [ -f artifacts/FULL_DONE ]; do sleep 120; done   # M1 full run finished (winner of the step-1 screens)
 ./supervise.sh tx_headM_reg_A --rep_cfg "{$base}" --task regression --bank artifacts/bank_reg --y_clip 30 \
-    --steps 6000 --stop_at 1000 --lr 3e-4 $COM --val_noises $VN --dev_real Beijing --shape_k 128
+    --steps 6000 --stop_at 1000 --lr 3e-4 $COM --ps "$PSJ" --val_noises $VN --dev_real Beijing --shape_k 128
 echo "[head2] $(date -Is) tx_headM_reg_A screen done" >> artifacts/logs/phase3.log
 for e in 1 8; do
   $PY real_eval_reg.py tx_headM_reg_A_e$e=artifacts/pretrain/tx_headM_reg_A/last.ckpt --datasets Beijing --ks all --n_ens $e \

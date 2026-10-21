@@ -475,7 +475,7 @@ def measure_layer(reps, mask, dev, g, P, B, R, C, K_, exact=None):
     return reps, mask, flags
 
 
-V7 = dict(p_joint=0.4, p_pop=0.6, p_exact_tab=0.3, p_spec=0.5, sub=1, tail_hi=1.0,
+V7 = dict(p_joint=0.4, p_pop=0.6, p_exact_tab=0.3, p_spec=0.5, sub=1, tail_hi=1.0, xor=0.0,
           p_plate=0.0, p_well=0.0, p_fail=0.0, p_lod=0.0, p_cens_r=0.0, p_mcar=0.0)
 V7_SETTINGS = {
     'v7': {},
@@ -904,9 +904,9 @@ def main():
     SHAPE_K = args.shape_k
     if args.ps:
         ov = json.loads(args.ps) if isinstance(args.ps, str) else args.ps
-        PS_TRAIN.update(ov)
-        V7.update(ov)  # the continuous prior accepts the same measurement-layer overrides
-        assert set(PS_TRAIN) == set(PS), args.ps
+        assert set(ov) <= set(PS) | set(V7), args.ps
+        PS_TRAIN.update({k: v for k, v in ov.items() if k in PS})
+        V7.update({k: v for k, v in ov.items() if k in V7})  # the continuous prior accepts the same measurement overrides
     if args.p6:  # training draws only: validation settings are defined relative to the default P6 (V6_SETTINGS)
         P6_TRAIN.update(json.loads(args.p6) if isinstance(args.p6, str) else args.p6)
         assert set(P6_TRAIN) == set(P6), args.p6
@@ -915,16 +915,19 @@ def main():
         assert set(w) <= set(TRAIN_NOISES), w
         NOISE_W = torch.tensor([float(w.get(nm, 1.0)) for nm in TRAIN_NOISES])
     model = make_model(args.mode, rep_cfg, args.task).to(dev)
+    # the replicate layer owns every parameter outside the backbone: `rep_*` plus the learned-location heads (`loc_*`,
+    # PLAN 2 step 1). Used for the init check, freeze, and the optimizer groups.
+    is_layer = lambda n: n.startswith('rep_') or n.startswith('loc_')
     if args.init or ARCH == 'tabicl':
         sd = torch.load(args.init, map_location=dev, weights_only=False)['state_dict'] if args.init else load_tabicl(TASK)[1]
         missing, unexpected = model.load_state_dict(sd, strict=False)
-        assert not unexpected and all(k.startswith('rep_') for k in missing), (missing, unexpected)
+        assert not unexpected and all(is_layer(k) for k in missing), (missing, unexpected)
     if args.freeze_backbone:  # no weight gradients for the backbone at all (saves memory and backward time)
         for n, p in model.named_parameters():
-            p.requires_grad_(n.startswith('rep_'))
-    params = [p for n, p in model.named_parameters() if not args.freeze_backbone or n.startswith('rep_')]
-    rep = [p for n, p in model.named_parameters() if n.startswith('rep_')]
-    rest = [p for n, p in model.named_parameters() if not n.startswith('rep_') and not args.freeze_backbone]
+            p.requires_grad_(is_layer(n))
+    params = [p for n, p in model.named_parameters() if not args.freeze_backbone or is_layer(n)]
+    rep = [p for n, p in model.named_parameters() if is_layer(n)]
+    rest = [p for n, p in model.named_parameters() if not is_layer(n) and not args.freeze_backbone]
     groups = [g for g in [dict(params=rest, lr=args.lr), dict(params=rep, lr=args.lr * args.rep_lr_mult)] if g['params']]
     if args.rep_lr_mult == 1.0:  # single group == the original optimizer layout (keeps old checkpoints resumable)
         groups = params

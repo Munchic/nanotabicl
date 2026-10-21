@@ -242,6 +242,26 @@ def huber_location(reps: torch.Tensor, mask: torch.Tensor, n_train: int, iters: 
     return torch.where(n > 1, mu, mean).to(reps.dtype)
 
 
+def pooled_scale(reps: torch.Tensor, mask: torch.Tensor, n_train: int) -> torch.Tensor:
+    """(B, 1, C) pooled robust column scale from the replicated CONTEXT cells (the huber_location scale, in raw
+    units): median over the column of |replicate - cell median| x the Gaussian small-n factor. inf where a column has
+    no replicated context cells."""
+    B, R, C, K = reps.shape
+    x = torch.where(mask, reps, 0.0).double()
+    n = mask.sum(-1)
+    med = linear_median(x, mask)
+    fac = torch.tensor(HUBER_SCALE_FACTOR + [HUBER_SCALE_FACTOR[-1]] * max(0, K + 1 - len(HUBER_SCALE_FACTOR)),
+                       dtype=x.dtype, device=x.device)[n.clamp(max=len(HUBER_SCALE_FACTOR) - 1)]
+    res = (x - med[..., None]).abs() * fac[..., None]
+    ok = mask & (n >= 2)[..., None] & (torch.arange(R, device=x.device) < n_train)[None, :, None, None]
+    flat = torch.where(ok, res, float('inf')).transpose(1, 2).reshape(B, C, -1)
+    cnt = ok.transpose(1, 2).reshape(B, C, -1).sum(-1)
+    srt = flat.sort(-1).values
+    lo, hi = ((cnt - 1).clamp(min=0) // 2), (cnt // 2).clamp(max=flat.shape[-1] - 1)
+    sig = 0.5 * (srt.gather(-1, lo[..., None]) + srt.gather(-1, hi[..., None])).squeeze(-1)  # (B, C)
+    return torch.where(cnt > 0, sig, float('inf'))[:, None]  # (B, 1, C)
+
+
 def fill_missing(reps: torch.Tensor, mask: torch.Tensor, n_train: int):
     """n = 0 cells (no measurement) -> one replicate at the column mean of the CONTEXT cell means (= the TabICLv2
     wrapper's NaN imputation). -> reps, mask, missing (B, R, C) bool or None (no n = 0 cell: inputs returned as is)."""
@@ -314,6 +334,12 @@ class ObsNanoTabICL(NanoTabICLv2):
         # (huber_location, column-pooled scale) instead of their means; n = 1 cells keep their value -> all-single tables
         # unchanged; with sd_cols, step 0 == the "Huber + sd" wrapper input (the best hand-built pair on cytometry)
         self.backbone_loc = backbone_loc
+        if backbone_loc == 'learned_m':  # PLAN 2 step 1: column-aware per-replicate weights (IRLS), starts at the mean
+            assert col_ctx, 'learned_m needs col_ctx (its column token)'
+            self.loc_c0 = nn.Parameter(torch.tensor(math.log(math.e - 1.0)))  # softplus -> 1
+            self.loc_w = nn.Sequential(nn.Linear(d_s + 2, 16), nn.Tanh(), nn.Linear(16, 1, bias=False))
+            nn.init.zeros_(self.loc_w[-1].weight)
+            self._loc_w = None
         if self.sd_learn:
             self.rep_sdcol = nn.Linear(d_s + 1, self.sd_learn, bias=False)
             nn.init.zeros_(self.rep_sdcol.weight)
@@ -448,8 +474,16 @@ class ObsNanoTabICL(NanoTabICLv2):
             rep_col = (n[:, :n_train] > 1).any(1).any(0)  # (C,): columns with replicated context cells (any table)
             if rep_col.any():
                 r = torch.where(mask, reps, 0.0)
-                mu = r.sum(-1, keepdim=True) / n.clamp(min=1)[..., None]
-                sd = torch.sqrt((torch.where(mask, reps - mu, 0.0) ** 2).sum(-1) / (n - 1).clamp(min=1))
+                if self.backbone_loc == 'learned_m' and self._loc_w is not None:
+                    w = self._loc_w.to(r.dtype)
+                    mu = x_c  # the learned weighted location, the same value the backbone sees
+                    var = ((w * (reps - mu[..., None]) ** 2).sum(-1)) / (w.sum(-1) - 1).clamp(min=1)
+                    sd = torch.sqrt(var.clamp_min(1e-8))  # exact ties (censoring limits) -> 0 variance, finite grad
+                    sd = torch.where(n > 1, sd, 0.0)
+                else:
+                    mu = r.sum(-1, keepdim=True) / n.clamp(min=1)[..., None]
+                    var = (torch.where(mask, reps - mu, 0.0) ** 2).sum(-1) / (n - 1).clamp(min=1)
+                    sd = torch.sqrt(var.clamp_min(1e-8))
                 base_c = x_c.shape[-1]
                 cols = [sd[..., rep_col].to(x_c.dtype)]
                 if self.sd_learn:  # S learned summary columns, replicated cells only (n = 1 -> 0)
@@ -672,6 +706,11 @@ class ObsNanoTabICL(NanoTabICLv2):
             if ctx_fn is not None:
                 u = torch.cat([run(self.rep_enc.col_summary, zm[c], mm[c], None if tm is None else tm[c]) for c in sl])
                 ctx_vec = ctx_fn(u)
+                if self.backbone_loc == 'learned_m':  # column token over ALL replicated cells (context + query, no labels)
+                    full = u.new_zeros(n_batch, n_rows, n_cols, u.shape[-1])
+                    full[multi] = u
+                    w_all = multi[..., None].to(u.dtype)
+                    loc_tok = (full * w_all).sum(1, keepdim=True) / w_all.sum(1, keepdim=True).clamp(min=1)  # (B,1,C,d_s)
             outs = [run(self.rep_enc, zm[c], mm[c], None if tm is None else tm[c],
                         ctx_tokens=None if ctx_tokens is None else ctx_tokens[c], flags=None if fm is None else fm[c],
                         ctx_vec=None if ctx_vec is None else ctx_vec[c]) for c in sl]
@@ -699,6 +738,25 @@ class ObsNanoTabICL(NanoTabICLv2):
                     med = linear_median(reps[multi], mask[multi])
                     att = mu + gt[:, 0] * (med - mu) + gt[:, 1] * (att - mu)
                 x_c[multi] = att.to(x.dtype)
+            if self.backbone_loc == 'learned_m':  # PLAN 2 step 1: weighted location from per-replicate residual weights
+                x_c = x.clone()
+                # pooled robust scale: a CONTEXT statistic, so it is not differentiated (the wrapper's preprocessing is
+                # fitted the same way); columns without replicated context cells fall back to the context column sd
+                s_c = pooled_scale(reps.detach(), mask, n_train).to(reps.dtype)
+                cm = torch.where(mask, reps.detach(), 0.0).sum(-1) / n.clamp(min=1)
+                ctx_sd = cm[:, :n_train].std(1, unbiased=False, keepdim=True).clamp(min=1e-3)  # (B, 1, C)
+                s_c = torch.where(torch.isfinite(s_c), s_c, ctx_sd).clamp_min(0.05 * ctx_sd)
+                mu = linear_median(torch.where(mask, reps, 0.0), mask)
+                ln = torch.log(n.clamp(min=1).to(reps.dtype))[..., None, None]
+                for _ in range(3):
+                    q = ((reps - mu[..., None]).abs() / (s_c[..., None] + 1e-6)).clamp(max=50.0)[..., None]
+                    feat = torch.cat([q, loc_tok[..., None, :].expand(n_batch, n_rows, n_cols, reps.shape[-1], -1),
+                                      ln.expand(n_batch, n_rows, n_cols, reps.shape[-1], 1)], dim=-1)
+                    w = torch.nn.functional.softplus(self.loc_c0 + self.loc_w(feat.to(self.loc_w[0].weight.dtype)).squeeze(-1))
+                    w = torch.where(mask, w.to(reps.dtype), 0.0)
+                    mu = (w * reps).sum(-1) / w.sum(-1).clamp(min=1e-3)
+                x_c = torch.where(multi, mu, x_c)
+                self._loc_w = w
         if self.aux and self.training:  # kept for aux_loss(); mu / sd: (B, 1, C) column standardization
             self._aux_state = (multi, vec, x_c, mu[..., 0], sd[..., 0])
         if self.dist_emb or self.temp_head:
@@ -847,6 +905,21 @@ if __name__ == '__main__':  # step 0 == stock model, and n = 1 everywhere == sto
         nn.init.normal_(sl.rep_sdcol.weight)
         print('sd_learn, random readout: n=1 vs stock:', (sl(reps, m1, y) - stock(reps[..., 0], y)).abs().max().item(),
               '| n>1 differs:', (sl(reps, mask, y) - stock(torch.cat([mean, sdv, zc], -1), y)).abs().max().item(), '(> 0)')
+    if '--learned_m' in __import__('sys').argv:  # PLAN 2 step 1: column-aware per-replicate weights
+        lm = ObsNanoTabICL(**cfg, center='mean', med_feat=True, std='medmad', zclip=10.0, robust_feats=True,
+                           dist_emb=True, temp_head=True, col_ctx=True, isab=16, n_sab=2, sd_cols=True, backbone_loc='learned_m')
+        lm.load_state_dict(stock.state_dict(), strict=False)
+        mean = torch.where(mask, reps, 0).sum(-1) / mask.sum(-1)
+        n_ = mask.sum(-1)
+        sdv = torch.sqrt((torch.where(mask, reps - mean[..., None], 0) ** 2).sum(-1) / (n_ - 1).clamp(min=1))
+        d0 = (lm(reps, mask, y) - stock(torch.cat([mean, sdv], -1), y)).abs().max().item()
+        print('learned_m: step0 vs stock(mean, sd):', d0, '(exact except all-tied cells, sd clamped at 1e-4)',
+              '| w at init all 1:', bool((lm._loc_w[mask].abs() - 1).max().item() < 1e-5), '| d0 < 1e-4:', d0 < 1e-4)
+        nn.init.normal_(lm.loc_w[-1].weight)  # randomize the weight network
+        a = lm(reps, mask, y)
+        print('learned_m, random g: n=1 vs stock:', (lm(reps, m1, y) - stock(reps[..., 0], y)).abs().max().item(),
+              '| n>1 differs:', (lm(reps, mask, y) - stock(torch.cat([mean, sdv], -1), y)).abs().max().item(), '(> 0)',
+              '| weights vary:', bool(lm._loc_w[mask].std().item() > 0))
     if '--huber_loc' in __import__('sys').argv:
         hl = ObsNanoTabICL(**cfg, center='mean', med_feat=True, std='medmad', zclip=10.0, robust_feats=True,
                            dist_emb=True, temp_head=True, col_ctx=True, isab=16, n_sab=2, sd_cols=True, joint=16, backbone_loc='huber')

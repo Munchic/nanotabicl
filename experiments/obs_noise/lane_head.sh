@@ -14,7 +14,7 @@ DEV=HAR,L1000_dose,CellPainting_dose,HVTN
 base='"center": "attn", "med_feat": true, "std": "medmad", "zclip": 10.0, "robust_feats": true, "dist_emb": true, "temp_head": true, "col_ctx": true, "d_s": 64, "n_sab": 2, "isab": 16, "joint": 16, "flag_emb": true, "miss_emb": true'
 COMMON="--task classification --steps 6000 --stop_at 1000 --mode obs --freeze_backbone --lr 3e-4 --arch tabicl --batch_size 32 --micro_batch 2 --warmup 200 --noise_set v7 --ps $PSV --val_every 250 --val_blocks 4 --val_noises $VN --log_every 25 --dev_real $DEV --dev_every 500 --dev_kill_margin 0.5 --dev_kill_until 1000"
 
-until grep -q "tx_shV4c_A evaluated" artifacts/logs/phase3.log; do sleep 120; done   # one shape/head run fits the GPU
+# V4b / V4c were killed (Huber+sd start is flat: V4a/V4b val Deltaacc ~0). The bar is the locked val_ref.jsonl.
 eval -u ${PY} devsplit.py --check "$DEV"
 ./supervise.sh tx_headM_A --rep_cfg "{$base}" $COMMON --shape_k 128
 echo "[head] $(date -Is) tx_headM_A screen done" >> artifacts/logs/phase3.log

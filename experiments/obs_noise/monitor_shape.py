@@ -9,7 +9,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 ARGS = [a for a in sys.argv[1:] if not a.startswith('--')]
 OPT = dict(a[2:].split('=', 1) if '=' in a else (a[2:], '1') for a in sys.argv[1:] if a.startswith('--'))
 RUNS = ARGS or ['tx_shV4a_A', 'tx_shV4b_A', 'tx_shV4c_A', 'tx_headM_A']
-REF = OPT.get('ref') or 'tx_shV4b_A'
+REF = OPT.get('ref') or ''
 TARGET = int(OPT.get('target', 6000))
 LIVE = subprocess.run(['pgrep', '-af', 'obs_train.py'], capture_output=True, text=True).stdout
 
@@ -61,7 +61,7 @@ for run in RUNS:
         m = '' if d0 is None or s == 0 else f'  ({v - d0:+.2f} vs step 0)'
         flag = '  KILL-WINDOW' if s <= 1000 and d0 is not None and v < d0 - 0.5 else ''
         print(f'   dev_real step {s:5d}: {v:7.2f}{m}{flag}')
-    R = val_delta(logv(REF)) if run != REF else None
+    R = val_delta(logv(REF)) if (REF and run != REF) else None
     vs0 = val_delta(L)
     if vs0:
         for s, d in vs0.items():
@@ -70,9 +70,10 @@ for run in RUNS:
         bym = {r['step']: r['val'] for r in logv(REF) if 'val' in r}
         for r in [r for r in L if 'val' in r][-1:]:
             if r['step'] in bym:
-                keys = [k for k in r['val'] if k != 'clean']
-                d = dict(acc=100 * sum(r['val'][k]['acc'] - bym[r['step']][k]['acc'] for k in keys) / len(keys),
-                         loss=sum(r['val'][k]['loss'] - bym[r['step']][k]['loss'] for k in keys) / len(keys))
-                print(f'   val step {r["step"]:5d} vs {REF} (same step): Δacc {d["acc"]:+.2f} pts  Δloss {d["loss"]:+.3f}')
+                keys = [k for k in r['val'] if k != 'clean' and k in bym[r['step']]]
+                if keys:
+                    d = dict(acc=100 * sum(r['val'][k]['acc'] - bym[r['step']][k]['acc'] for k in keys) / len(keys),
+                             loss=sum(r['val'][k]['loss'] - bym[r['step']][k]['loss'] for k in keys) / len(keys))
+                    print(f'   val step {r["step"]:5d} vs {REF} (same step): Δacc {d["acc"]:+.2f} pts  Δloss {d["loss"]:+.3f}')
     if kill:
         print(f'   KILL: {kill}')
